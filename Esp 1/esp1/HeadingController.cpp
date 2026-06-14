@@ -1,8 +1,9 @@
 #include "HeadingController.h"
 
-float Kp_heading_rpm = 80.0f;
-float Ki_heading_rpm_per_rad_s = 5.0f;
+float Kp_heading_rpm = 220.0f;
+float Ki_heading_rpm_per_rad_s = 30.0f;
 bool headingControlEnabled = true;
+bool headingHoldActive = false;
 bool invertHeadingCorrection = true;
 
 float turnCorrectionRPM = 0.0f;
@@ -20,6 +21,10 @@ bool invertRotateDirection = true;
 extern float currentDtSeconds;
 
 namespace {
+
+constexpr float HEADING_HOLD_TOLERANCE_DEG = 1.0f;
+constexpr float HEADING_HOLD_TOLERANCE_RAD =
+  HEADING_HOLD_TOLERANCE_DEG * (PI_F / 180.0f);
 
 float wrapAngleRadLocal(float angle) {
   // Remember requested direction before wrapping.
@@ -41,6 +46,7 @@ float wrapAngleRadLocal(float angle) {
 }  // namespace
 
 void resetHeadingControllerState() {
+  headingHoldActive = false;
   turnCorrectionRPM = 0.0f;
   leftRpmComposed = 0.0f;
   rightRpmComposed = 0.0f;
@@ -64,24 +70,29 @@ void runHeadingLoopAndComposeWheelTargets(
   leftRpmComposed = 0.0f;
   rightRpmComposed = 0.0f;
 
-  if (!positionModeActive) {
+  if (!positionModeActive && !headingHoldActive) {
     headingIntegralRadS = 0.0f;
     setAllTargetRpm(0.0f);
     return;
   }
 
-  if (moveForwardMode) {
+  if (moveForwardMode || headingHoldActive) {
     if (headingControlEnabled) {
       headingErrorRad = wrapAngleRadLocal(targetHeadingRad - currentHeadingRad);
 
-      headingIntegralRadS += headingErrorRad * currentDtSeconds;
+      if (fabs(headingErrorRad) <= HEADING_HOLD_TOLERANCE_RAD) {
+        headingIntegralRadS = 0.0f;
+        turnCorrectionRPM = 0.0f;
+      } else {
+        headingIntegralRadS += headingErrorRad * currentDtSeconds;
 
-      turnCorrectionRPM =
-        (Kp_heading_rpm * headingErrorRad) +
-        (Ki_heading_rpm_per_rad_s * headingIntegralRadS);
+        turnCorrectionRPM =
+          (Kp_heading_rpm * headingErrorRad) +
+          (Ki_heading_rpm_per_rad_s * headingIntegralRadS);
 
-      if (invertHeadingCorrection) {
-        turnCorrectionRPM = -turnCorrectionRPM;
+        if (invertHeadingCorrection) {
+          turnCorrectionRPM = -turnCorrectionRPM;
+        }
       }
     } else {
       headingErrorRad = 0.0f;

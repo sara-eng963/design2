@@ -564,6 +564,8 @@ String buildStatusLine() {
   status += String(HEADING_TOLERANCE_DEG, 1);
   status += " active=";
   status += motionIsActive() ? "1" : "0";
+  status += " headingHold=";
+  status += headingHoldActive ? "1" : "0";
   status += " fault=";
   status += motionFaultToString(motionFaultCode);
   status += " ros=";
@@ -671,6 +673,7 @@ bool initializeNewMove(float distanceM, bool useManualHeading, float manualHeadi
   targetHeadingRad = useManualHeading
     ? wrapAngleRad(manualHeadingDeg * (PI_F / 180.0f))
     : currentHeadingRad;
+  headingHoldActive = true;
   headingErrorRad = 0.0f;
   headingIntegralRadS = 0.0f;
   turnCorrectionRPM = 0.0f;
@@ -1150,9 +1153,18 @@ void controlLoopTask(void *parameter) {
     if (motionMode == MODE_MOVE_FORWARD) {
       runPositionLoop(dtSec, now);
       if (motionResultCode != MOTION_RESULT_NONE) {
-        setIdleStateAndStopMotors();
-        unlockState();
-        continue;
+        if ((motionResultCode == MOTION_RESULT_DONE) &&
+            (motionResultMode == MODE_MOVE_FORWARD) &&
+            headingHoldActive) {
+          positionModeActive = false;
+          motionMode = MODE_IDLE;
+          baseForwardRpm = 0.0f;
+          rawBaseForwardRpm = 0.0f;
+        } else {
+          setIdleStateAndStopMotors();
+          unlockState();
+          continue;
+        }
       }
     } else {
       baseForwardRpm = 0.0f;
@@ -1160,7 +1172,7 @@ void controlLoopTask(void *parameter) {
       distanceErrorM = targetDistanceM - currentDistanceM;
     }
 
-    if (!positionModeActive) {
+    if (!positionModeActive && !headingHoldActive) {
       // Hold hard stop when idle.
       resetVelocityControllerState();
       stopAllMotorHardware();
@@ -1208,7 +1220,7 @@ void controlLoopTask(void *parameter) {
       );
     }
 
-    if (!positionModeActive) {
+    if (!positionModeActive && !headingHoldActive) {
       // Could become inactive if IMU safety stop happened.
       resetVelocityControllerState();
       stopAllMotorHardware();
@@ -1257,6 +1269,7 @@ String buildStatusJson() {
   const float snap_Ki_pos              = Ki_pos;
   const float snap_Kp_heading          = Kp_heading_rpm;
   const float snap_Ki_heading          = Ki_heading_rpm_per_rad_s;
+  const bool snap_headingHoldActive    = headingHoldActive;
   const float snap_Kp_rotate           = Kp_rotate_rpm;
   const float snap_HTOL                = HEADING_TOLERANCE_DEG;
   const float snap_curDist             = currentDistanceM;
@@ -1287,6 +1300,7 @@ String buildStatusJson() {
   j += "\"Ki_pos\":";           j += String(snap_Ki_pos,     3); j += ",";
   j += "\"Kp_heading_rpm\":";   j += String(snap_Kp_heading, 3); j += ",";
   j += "\"Ki_heading_rpm_per_rad_s\":"; j += String(snap_Ki_heading, 3); j += ",";
+  j += "\"headingHoldActive\":"; j += snap_headingHoldActive ? "true" : "false"; j += ",";
   j += "\"Kp_rotate_rpm\":";    j += String(snap_Kp_rotate,  3); j += ",";
   j += "\"HEADING_TOLERANCE_DEG\":"; j += String(snap_HTOL,  2); j += ",";
   for (int i = 0; i < WHEEL_COUNT; i++) {

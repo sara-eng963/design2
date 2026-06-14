@@ -11,8 +11,8 @@ float previousVelocityError[WHEEL_COUNT] = {0, 0, 0, 0};
 float outputPwmUnclamped[WHEEL_COUNT] = {0, 0, 0, 0};
 int finalPwm[WHEEL_COUNT] = {0, 0, 0, 0};
 
-float kpVel[WHEEL_COUNT] = {4.0f, 4.0f, 4.5f, 5.5f};
-float kiVel[WHEEL_COUNT] = {1.5f, 2.5f, 1.5f, 1.5f};
+float kpVel[WHEEL_COUNT] = {6.5f, 6.5f, 7.0f, 6.5f};
+float kiVel[WHEEL_COUNT] = {0.15f, 0.15f, 0.15f, 0.15f};
 float kdVel[WHEEL_COUNT] = {0.0f, 0.0f, 0.0f, 0.0f};
 
 void setAllTargetRpm(float rpmValue) {
@@ -51,6 +51,18 @@ void runVelocityLoopForWheel(WheelIndex wheel, float dtSec) {
     (kiVel[i] * velocityIntegral[i]) +
     (kdVel[i] * velocityDerivative[i]);
 
-  finalPwm[i] = clampSignedPwm((int)outputPwmUnclamped[i]);
+  int finalPwmCommand = (int)outputPwmUnclamped[i];
+
+  if (targetRpm[i] > 0.0f && finalPwmCommand < 0) {
+    finalPwmCommand = 0;
+  }
+  if (targetRpm[i] < 0.0f && finalPwmCommand > 0) {
+    finalPwmCommand = 0;
+  }
+  if (targetRpm[i] == 0.0f) {
+    finalPwmCommand = 0;
+  }
+
+  finalPwm[i] = clampSignedPwm(finalPwmCommand);
   previousVelocityError[i] = velocityError[i];
 }

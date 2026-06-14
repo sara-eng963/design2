@@ -7,8 +7,8 @@
 #include "MotorDriver.h"
 #include "WheelVelocityController.h"
 
-float Kp_pos = 1.2f;
-float Ki_pos = 0.0f;
+float Kp_pos = 0.4f;
+float Ki_pos = 0.1f;
 constexpr float MAX_VX = 0.5f;
 
 bool positionModeActive = false;

@@ -7,6 +7,7 @@
 extern float Kp_heading_rpm;
 extern float Ki_heading_rpm_per_rad_s;
 extern bool headingControlEnabled;
+extern bool headingHoldActive;
 extern bool invertHeadingCorrection;
 
 extern float turnCorrectionRPM;
