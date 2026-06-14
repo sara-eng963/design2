@@ -16,7 +16,8 @@ extern bool positionModeActive;
 enum MotionMode {
   MODE_IDLE = 0,
   MODE_MOVE_FORWARD = 1,
-  MODE_ROTATE_TO_HEADING = 2
+  MODE_ROTATE_TO_HEADING = 2,
+  MODE_MANUAL_VELOCITY
 };
 
 enum MotionFaultCode {

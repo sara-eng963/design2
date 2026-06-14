@@ -20,6 +20,7 @@
 #include "PositionController.h"
 #include "WheelVelocityController.h"
 #include "WebControl.h"
+#include "manual.h"
 #include "WifiConfig.h"
 #include <WiFi.h>
 
@@ -1014,6 +1015,33 @@ bool executeCommandLine(const String &commandLine, String &response) {
     return true;
   }
 
+  if (key == "MANUAL") {
+    String tokens[3];
+    int tokenCount = splitArguments(arg, tokens, 3);
+    if (tokenCount != 3) {
+      response = "ERR FORMAT MANUAL <vx> <vy> <wz>";
+      lastCommandResponse = response;
+      unlockState();
+      return false;
+    }
+    float vx, vy, wz;
+    if (!tryParseFloatToken(tokens[0], vx) ||
+        !tryParseFloatToken(tokens[1], vy) ||
+        !tryParseFloatToken(tokens[2], wz)) {
+      response = "ERR INVALID NUMBER";
+      lastCommandResponse = response;
+      unlockState();
+      return false;
+    }
+    updateManualCommand(vx, vy, wz);
+    motionMode = MODE_MANUAL_VELOCITY;
+    positionModeActive = true;
+    response = "ACK MANUAL";
+    lastCommandResponse = response;
+    unlockState();
+    return true;
+  }
+
   unlockState();
   response = "ERR UNKNOWN_COMMAND";
   lastCommandResponse = response;
@@ -1149,6 +1177,21 @@ void controlLoopTask(void *parameter) {
     if (motionMode == MODE_MOVE_FORWARD) {
       currentDistanceM += avgDeltaDistanceM;
     }
+
+    if (motionMode == MODE_MANUAL_VELOCITY) {
+    if (checkManualWatchdog()) {
+        // watchdog already stopped motors and set mode to IDLE
+        unlockState();
+        continue;
+    }
+    runManualMixer();                     // writes targetRpm[]
+    for (int i = 0; i < WHEEL_COUNT; i++) {
+        runVelocityLoopForWheel((WheelIndex)i, dtSec);
+    }
+    applyAllWheelMotorCommands(finalPwm);
+    unlockState();
+    continue;   // skip the rest of the autonomous logic
+}
 
     if (motionMode == MODE_MOVE_FORWARD) {
       runPositionLoop(dtSec, now);
@@ -1349,8 +1392,20 @@ void setup() {
 
   stateMutex = xSemaphoreCreateMutex();
 
+  initManualMode();
+
   if (lockState(pdMS_TO_TICKS(50))) {
     setIdleStateAndStopMotors();
+
+    // Match the heading-control test behavior: hold the startup yaw even
+    // before the first MOVE command, with zero forward RPM.
+    currentHeadingRad = app::imuDriver().displayedYawRad();
+    if (imuHealthy && isfinite(currentHeadingRad)) {
+      targetHeadingRad = currentHeadingRad;
+      headingErrorRad = 0.0f;
+      headingIntegralRadS = 0.0f;
+      headingHoldActive = true;
+    }
 
     noInterrupts();
     for (int i = 0; i < WHEEL_COUNT; i++) {
