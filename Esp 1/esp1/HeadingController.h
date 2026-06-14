@@ -6,7 +6,6 @@
 
 extern float Kp_heading_rpm;
 extern float Ki_heading_rpm_per_rad_s;
-extern float MAX_TURN_CORRECTION_RPM;
 extern bool headingControlEnabled;
 extern bool invertHeadingCorrection;
 
@@ -17,12 +16,10 @@ extern float targetHeadingRad;
 extern float headingErrorRad;
 extern float headingIntegralRadS;
 extern float Kp_rotate_rpm;
-extern float MAX_ROTATE_RPM;
-extern float MIN_ROTATE_RPM;
+extern float Ki_rotate_rpm_per_rad_s;
+extern float rotateIntegralRadS;
 extern float HEADING_TOLERANCE_DEG;
 extern bool invertRotateDirection;
-
-constexpr float HEADING_INTEGRAL_LIMIT_RAD_S = 2.0f;
 
 void resetHeadingControllerState();
 void runHeadingLoopAndComposeWheelTargets(

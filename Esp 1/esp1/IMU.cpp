@@ -23,6 +23,8 @@ constexpr float kGyroLsbPerDegPerSec = 65.5f;
 constexpr float kDegToRad = kPi / 180.0f;
 constexpr float kComplementaryAlpha = 0.98f;
 constexpr float kYawDeadbandRadPerSec = 0.02f;
+constexpr float kYawScalePositive = 0.976f;
+constexpr float kYawScaleNegative = 0.981f;
 constexpr float kStillEnterAccelToleranceMps2 = 0.30f;
 constexpr float kStillExitAccelToleranceMps2 = 0.45f;
 constexpr float kStillEnterGyroThresholdRadPerSec = 0.06f;
@@ -119,6 +121,7 @@ bool ImuDriver::begin() {
     gyro_bias_z_rad_s_ = 0.0f;
     raw_gyro_z_rad_s_ = 0.0f;
     corrected_gyro_z_rad_s_ = 0.0f;
+    last_dt_s_ = 0.0f;
     last_update_us_ = 0U;
     motion_state_since_us_ = 0U;
     motion_state_ = MotionState::STILL;
@@ -163,12 +166,19 @@ bool ImuDriver::read(IMUState& imu_state) {
     imu_state.gyro_x = raw_gyro_x - gyro_bias_x_rad_s_;
     imu_state.gyro_y = raw_gyro_y - gyro_bias_y_rad_s_;
     imu_state.gyro_z = raw_gyro_z - gyro_bias_z_rad_s_;
-    corrected_gyro_z_rad_s_ = imu_state.gyro_z;
+    float corrected_gz = imu_state.gyro_z;
+    if (corrected_gz >= 0.0f) {
+        corrected_gz *= kYawScalePositive;
+    } else {
+        corrected_gz *= kYawScaleNegative;
+    }
+    corrected_gyro_z_rad_s_ = corrected_gz;
 
     const std::uint32_t now_us = micros();
     const float dt_seconds = (last_update_us_ == 0U)
         ? 0.0f
         : static_cast<float>(now_us - last_update_us_) * 1.0e-6f;
+    last_dt_s_ = dt_seconds;
     last_update_us_ = now_us;
 
     const float accel_roll = std::atan2(imu_state.accel_y, imu_state.accel_z);
@@ -219,10 +229,16 @@ bool ImuDriver::read(IMUState& imu_state) {
         imu_state.gyro_x = raw_gyro_x - gyro_bias_x_rad_s_;
         imu_state.gyro_y = raw_gyro_y - gyro_bias_y_rad_s_;
         imu_state.gyro_z = raw_gyro_z - gyro_bias_z_rad_s_;
-        corrected_gyro_z_rad_s_ = imu_state.gyro_z;
+        float corrected_gz = imu_state.gyro_z;
+        if (corrected_gz >= 0.0f) {
+            corrected_gz *= kYawScalePositive;
+        } else {
+            corrected_gz *= kYawScaleNegative;
+        }
+        corrected_gyro_z_rad_s_ = corrected_gz;
     }
 
-    float yaw_rate_for_integration = imu_state.gyro_z;
+    float yaw_rate_for_integration = corrected_gyro_z_rad_s_;
     if (std::fabs(yaw_rate_for_integration) < kYawDeadbandRadPerSec) {
         yaw_rate_for_integration = 0.0f;
     }

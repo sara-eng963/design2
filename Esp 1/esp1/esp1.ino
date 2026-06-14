@@ -19,6 +19,9 @@
 #include "MotorDriver.h"
 #include "PositionController.h"
 #include "WheelVelocityController.h"
+#include "WebControl.h"
+#include "WifiConfig.h"
+#include <WiFi.h>
 
 #ifndef ENABLE_SERIAL_TEXT_COMMANDS
 #define ENABLE_SERIAL_TEXT_COMMANDS 0
@@ -96,7 +99,7 @@ rcl_allocator_t allocator = rcl_get_default_allocator();
 rcl_node_t node = rcl_get_zero_initialized_node();
 rclc_executor_t executor = {};
 
-static char drive_status_buffer[256];
+static char drive_status_buffer[384];
 static char drive_cmd_buffer[128];
 constexpr std::size_t DRIVE_STATUS_QUEUE_DEPTH = 8U;
 static char drive_status_queue[DRIVE_STATUS_QUEUE_DEPTH][sizeof(drive_status_buffer)];
@@ -110,6 +113,11 @@ float interruptedMoveDistM = 0.0f;
 float interruptedMoveTargetM = 0.0f;
 float interruptedMoveHeadingDeg = 0.0f;
 bool interruptedMoveValid = false;
+
+float lastDoneRotateYawDeg = 0.0f;
+float lastDoneRotateTargetDeg = 0.0f;
+float lastDoneRotateErrDeg = 0.0f;
+bool lastDoneRotateSnapshotValid = false;
 
 constexpr TickType_t MICRO_ROS_TASK_DELAY_TICKS = pdMS_TO_TICKS(2);
 constexpr TickType_t MICRO_ROS_WAITING_AGENT_DELAY_TICKS = pdMS_TO_TICKS(500);
@@ -493,7 +501,6 @@ void finalizeMotionStop() {
   resetHeadingControllerState();
   baseForwardRpm = 0.0f;
   rawBaseForwardRpm = 0.0f;
-  minimumMoveRpmActive = false;
   for (int i = 0; i < WHEEL_COUNT; i++) {
     finalPwm[i] = 0;
     appliedPwm[i] = 0;
@@ -503,6 +510,7 @@ void finalizeMotionStop() {
 
 void setIdleStateAndStopMotors() {
   finalizeMotionStop();
+  rotateIntegralRadS = 0.0f;
 }
 
 void clearAllMotionNotifications() {
@@ -536,16 +544,22 @@ String buildStatusLine() {
   status += String(targetHeadingDeg, 1);
   status += " headingErr=";
   status += String(headingErrorDeg, 1);
+  if (lastDoneRotateSnapshotValid) {
+    status += " lastDoneYaw=";
+    status += String(lastDoneRotateYawDeg, 2);
+    status += " lastDoneTarget=";
+    status += String(lastDoneRotateTargetDeg, 2);
+    status += " lastDoneErr=";
+    status += String(lastDoneRotateErrDeg, 2);
+  }
   status += " baseRPM=";
   status += String(baseForwardRpm, 1);
   status += " turnRPM=";
   status += String(turnCorrectionRPM, 1);
   status += " RKP=";
   status += String(Kp_rotate_rpm, 1);
-  status += " RMAX=";
-  status += String(MAX_ROTATE_RPM, 1);
-  status += " RMIN=";
-  status += String(MIN_ROTATE_RPM, 1);
+  status += " RKI=";
+  status += String(Ki_rotate_rpm_per_rad_s, 2);
   status += " RTOL=";
   status += String(HEADING_TOLERANCE_DEG, 1);
   status += " active=";
@@ -554,6 +568,19 @@ String buildStatusLine() {
   status += motionFaultToString(motionFaultCode);
   status += " ros=";
   status += microRosInitialized ? "1" : "0";
+  const float rawGyroZDegPerSec = app::imuDriver().rawGyroZRadPerSec() * (180.0f / PI_F);
+  const float correctedGyroZDegPerSec = app::imuDriver().correctedGyroZRadPerSec() * (180.0f / PI_F);
+  const float gyroBiasZDegPerSec = app::imuDriver().gyroBiasZRadPerSec() * (180.0f / PI_F);
+  status += " rawGz=";
+  status += String(rawGyroZDegPerSec, 2);
+  status += " corrGz=";
+  status += String(correctedGyroZDegPerSec, 2);
+  status += " biasZ=";
+  status += String(gyroBiasZDegPerSec, 2);
+  status += " imuState=";
+  status += app::imuDriver().motionStateName();
+  status += " dtMs=";
+  status += String(app::imuDriver().lastDtMs(), 3);
   return status;
 }
 
@@ -566,6 +593,16 @@ void announceMotionResultIfNeeded() {
 
   if (motionResultCode == MOTION_RESULT_DONE) {
     report = String("DONE ") + motionResultLabel(motionResultMode);
+    if ((motionResultMode == MODE_ROTATE_TO_HEADING) && lastDoneRotateSnapshotValid) {
+      report += " yaw=";
+      report += String(lastDoneRotateYawDeg, 2);
+      report += " target=";
+      report += String(lastDoneRotateTargetDeg, 2);
+      report += " err=";
+      report += String(lastDoneRotateErrDeg, 2);
+      report += " rtol=";
+      report += String(radToDeg(headingToleranceRad()), 2);
+    }
   } else if (motionResultCode == MOTION_RESULT_FAULT) {
     report = String("FAULT ") + motionFaultToString(motionFaultCode);
   }
@@ -649,8 +686,7 @@ bool initializeNewMove(float distanceM, bool useManualHeading, float manualHeadi
     lastDeltaCounts[i] = 0;
   }
 
-  // MOVE completion uses both tolerance and a short stable-in-window timer so
-  // the robot does not chatter around the finish line.
+  // MOVE completes on the first control cycle inside the 5 mm tolerance.
   beginMotionTimingWindow(millis());
   return true;
 }
@@ -680,7 +716,7 @@ bool initializeNewRotation(float targetHeadingDeg) {
   targetDistanceM = 0.0f;
   baseForwardRpm = 0.0f;
   rawBaseForwardRpm = 0.0f;
-  minimumMoveRpmActive = false;
+  rotateIntegralRadS = 0.0f;
   setAllTargetRpm(0.0f);
   // ROTATE uses heading-only completion and timeout logic, not distance.
   beginMotionTimingWindow(millis());
@@ -704,8 +740,8 @@ void emergencyStopAndReset() {
 // - ROTATE <heading_deg>
 // - STOP
 // - STATUS
-// - HEADING ON|OFF, HKP, HKI, HMAX, HINVERT
-// - RKP, RMAX, RMIN, RTOL, RINVERT
+// - HEADING ON|OFF, HKP, HKI, HINVERT
+// - RKP, RKI, RTOL, RINVERT
 bool executeCommandLine(const String &commandLine, String &response) {
   String cmd = commandLine;
   cmd.trim();
@@ -847,18 +883,6 @@ bool executeCommandLine(const String &commandLine, String &response) {
     return true;
   }
 
-  if (key == "HMAX") {
-    // hmax limits correction strength for safety and smoothness.
-    // If turns are too weak, increase hmax. If too aggressive, reduce it.
-    MAX_TURN_CORRECTION_RPM = arg.toFloat();
-    if (MAX_TURN_CORRECTION_RPM < 0.0f) MAX_TURN_CORRECTION_RPM = 0.0f;
-    if (MAX_TURN_CORRECTION_RPM > 120.0f) MAX_TURN_CORRECTION_RPM = 120.0f;
-    response = String("ACK HMAX ") + String(MAX_TURN_CORRECTION_RPM, 2);
-    lastCommandResponse = response;
-    unlockState();
-    return true;
-  }
-
   if (key == "HINVERT") {
     // Use hinvert if heading correction direction is reversed.
     // Example symptom: robot drifts right and controller makes it drift more right.
@@ -878,21 +902,10 @@ bool executeCommandLine(const String &commandLine, String &response) {
     return true;
   }
 
-  if (key == "RMAX") {
-    MAX_ROTATE_RPM = arg.toFloat();
-    if (MAX_ROTATE_RPM < 0.0f) MAX_ROTATE_RPM = 0.0f;
-    if (MAX_ROTATE_RPM > MAX_WHEEL_TARGET_RPM) MAX_ROTATE_RPM = MAX_WHEEL_TARGET_RPM;
-    response = String("ACK RMAX ") + String(MAX_ROTATE_RPM, 2);
-    lastCommandResponse = response;
-    unlockState();
-    return true;
-  }
-
-  if (key == "RMIN") {
-    MIN_ROTATE_RPM = arg.toFloat();
-    if (MIN_ROTATE_RPM < 0.0f) MIN_ROTATE_RPM = 0.0f;
-    if (MIN_ROTATE_RPM > MAX_WHEEL_TARGET_RPM) MIN_ROTATE_RPM = MAX_WHEEL_TARGET_RPM;
-    response = String("ACK RMIN ") + String(MIN_ROTATE_RPM, 2);
+  if (key == "RKI") {
+    Ki_rotate_rpm_per_rad_s = arg.toFloat();
+    if (Ki_rotate_rpm_per_rad_s < 0.0f) Ki_rotate_rpm_per_rad_s = 0.0f;
+    response = String("ACK RKI ") + String(Ki_rotate_rpm_per_rad_s, 2);
     lastCommandResponse = response;
     unlockState();
     return true;
@@ -911,6 +924,88 @@ bool executeCommandLine(const String &commandLine, String &response) {
   if (key == "RINVERT" || key == "ROTATE_INVERT") {
     invertRotateDirection = !invertRotateDirection;
     response = String("ACK RINVERT ") + (invertRotateDirection ? "ON" : "OFF");
+    lastCommandResponse = response;
+    unlockState();
+    return true;
+  }
+
+  if (key == "PKP") {
+    Kp_pos = arg.toFloat();
+    if (Kp_pos < 0.0f) Kp_pos = 0.0f;
+    response = String("ACK PKP ") + String(Kp_pos, 3);
+    lastCommandResponse = response;
+    unlockState();
+    return true;
+  }
+
+  if (key == "PKI") {
+    Ki_pos = arg.toFloat();
+    if (Ki_pos < 0.0f) Ki_pos = 0.0f;
+    response = String("ACK PKI ") + String(Ki_pos, 3);
+    lastCommandResponse = response;
+    unlockState();
+    return true;
+  }
+
+  if (key == "VKP") {
+    String tokens[2];
+    const int tokenCount = splitArguments(arg, tokens, 2);
+    float val = 0.0f;
+    int idx = -1;
+    if (tokenCount == 2 && tryParseFloatToken(tokens[1], val)) {
+      idx = tokens[0].toInt();
+    }
+    if (idx < 0 || idx > 3) {
+      unlockState();
+      response = "ERR FORMAT VKP <wheel_index 0-3> <value>";
+      lastCommandResponse = response;
+      return false;
+    }
+    if (val < 0.0f) val = 0.0f;
+    kpVel[idx] = val;
+    response = String("ACK VKP[") + String(idx) + "] " + String(val, 3);
+    lastCommandResponse = response;
+    unlockState();
+    return true;
+  }
+
+  if (key == "VKI") {
+    String tokens[2];
+    const int tokenCount = splitArguments(arg, tokens, 2);
+    float val = 0.0f;
+    int idx = -1;
+    if (tokenCount == 2 && tryParseFloatToken(tokens[1], val)) {
+      idx = tokens[0].toInt();
+    }
+    if (idx < 0 || idx > 3) {
+      unlockState();
+      response = "ERR FORMAT VKI <wheel_index 0-3> <value>";
+      lastCommandResponse = response;
+      return false;
+    }
+    if (val < 0.0f) val = 0.0f;
+    kiVel[idx] = val;
+    response = String("ACK VKI[") + String(idx) + "] " + String(val, 3);
+    lastCommandResponse = response;
+    unlockState();
+    return true;
+  }
+
+  if (key == "VKPALL") {
+    float val = arg.toFloat();
+    if (val < 0.0f) val = 0.0f;
+    for (int i = 0; i < WHEEL_COUNT; i++) kpVel[i] = val;
+    response = String("ACK VKPALL ") + String(val, 3);
+    lastCommandResponse = response;
+    unlockState();
+    return true;
+  }
+
+  if (key == "VKIALL") {
+    float val = arg.toFloat();
+    if (val < 0.0f) val = 0.0f;
+    for (int i = 0; i < WHEEL_COUNT; i++) kiVel[i] = val;
+    response = String("ACK VKIALL ") + String(val, 3);
     lastCommandResponse = response;
     unlockState();
     return true;
@@ -992,11 +1087,13 @@ void controlLoopTask(void *parameter) {
 
     currentDtSeconds = dtSec;
 
-    // Update IMU exactly once per control cycle.
-    // This is the only place that advances yaw integration in runtime.
-    // Web/status/getters only read already-updated state.
+    // Yaw is integrated inside the IMU update task.
+    // The control loop only reads displayedYawRad() for control/debug.
     if (!imuHealthy) {
       if (motionIsActive()) {
+        if (motionMode == MODE_ROTATE_TO_HEADING) {
+          rotateIntegralRadS = 0.0f;
+        }
         requestMotionResult(MOTION_RESULT_FAULT, motionMode, MOTION_FAULT_IMU);
       }
       setIdleStateAndStopMotors();
@@ -1008,6 +1105,9 @@ void controlLoopTask(void *parameter) {
     if (!isfinite(currentHeadingRad)) {
       imuHealthy = false;
       if (motionIsActive()) {
+        if (motionMode == MODE_ROTATE_TO_HEADING) {
+          rotateIntegralRadS = 0.0f;
+        }
         requestMotionResult(MOTION_RESULT_FAULT, motionMode, MOTION_FAULT_IMU);
       }
       setIdleStateAndStopMotors();
@@ -1057,7 +1157,6 @@ void controlLoopTask(void *parameter) {
     } else {
       baseForwardRpm = 0.0f;
       rawBaseForwardRpm = 0.0f;
-      minimumMoveRpmActive = false;
       distanceErrorM = targetDistanceM - currentDistanceM;
     }
 
@@ -1075,19 +1174,24 @@ void controlLoopTask(void *parameter) {
       headingErrorRad = wrapAngleRad(targetHeadingRad - currentHeadingRad);
 
       if ((motionStartMs != 0U) && ((now - motionStartMs) >= ROTATE_TIMEOUT_MS)) {
+        rotateIntegralRadS = 0.0f;
         requestMotionResult(MOTION_RESULT_FAULT, MODE_ROTATE_TO_HEADING, MOTION_FAULT_TIMEOUT);
       } else if (fabs(headingErrorRad) <= headingToleranceRad()) {
+        lastDoneRotateYawDeg = radToDeg(currentHeadingRad);
+        lastDoneRotateTargetDeg = radToDeg(targetHeadingRad);
+        lastDoneRotateErrDeg = radToDeg(headingErrorRad);
+        lastDoneRotateSnapshotValid = true;
+        rotateIntegralRadS = 0.0f;
         // Demo behavior: finish immediately once we enter the heading window.
         setAllTargetRpm(0.0f);
         turnCorrectionRPM = 0.0f;
         leftRpmComposed = 0.0f;
         rightRpmComposed = 0.0f;
         requestMotionResult(MOTION_RESULT_DONE, MODE_ROTATE_TO_HEADING, MOTION_FAULT_NONE);
-      } else {
-        completionStableSinceMs = 0U;
       }
 
       if (motionResultCode != MOTION_RESULT_NONE) {
+        rotateIntegralRadS = 0.0f;
         setIdleStateAndStopMotors();
         unlockState();
         continue;
@@ -1124,6 +1228,78 @@ void controlLoopTask(void *parameter) {
 // Serial commands are still available through USB serial.
 
 // -----------------------------
+// Web status JSON provider
+// -----------------------------
+// Called from the web server handler (loop() thread).
+// Acquires stateMutex with a short timeout so it never blocks the control loop.
+// JSON keys for arrays are flattened (kpVel_0 … kpVel_3) so the browser-side
+// refreshStatus() function can update them with a simple id lookup.
+String buildStatusJson() {
+  if (!lockState(pdMS_TO_TICKS(20))) {
+    return "{\"error\":\"LOCK_BUSY\"}";
+  }
+
+  const float yawDeg       = radToDeg(currentHeadingRad);
+  const float tgtYawDeg    = radToDeg(targetHeadingRad);
+  const float hErrDeg      = radToDeg(headingErrorRad);
+  const char *faultStr     = motionFaultToString(motionFaultCode);
+  const char *modeStr      = modeToString(motionMode);
+  const bool  active       = motionIsActive();
+
+  // Snapshot all values while lock is held, then build the string after unlock
+  // to keep the critical section as short as possible.
+  float snap_kpVel[WHEEL_COUNT], snap_kiVel[WHEEL_COUNT];
+  for (int i = 0; i < WHEEL_COUNT; i++) {
+    snap_kpVel[i] = kpVel[i];
+    snap_kiVel[i] = kiVel[i];
+  }
+  const float snap_Kp_pos              = Kp_pos;
+  const float snap_Ki_pos              = Ki_pos;
+  const float snap_Kp_heading          = Kp_heading_rpm;
+  const float snap_Ki_heading          = Ki_heading_rpm_per_rad_s;
+  const float snap_Kp_rotate           = Kp_rotate_rpm;
+  const float snap_HTOL                = HEADING_TOLERANCE_DEG;
+  const float snap_curDist             = currentDistanceM;
+  const float snap_tgtDist             = targetDistanceM;
+  const float snap_distErr             = distanceErrorM;
+  const float snap_baseRpm             = baseForwardRpm;
+  const float snap_turnRpm             = turnCorrectionRPM;
+  // Copy lastCommandResponse safely (may contain arbitrary text – strip quotes).
+  String safeLastCmd = lastCommandResponse;
+  safeLastCmd.replace("\"", "'");
+
+  unlockState();
+
+  String j;
+  j.reserve(512);
+  j += "{";
+  j += "\"mode\":\"";         j += modeStr;          j += "\",";
+  j += "\"active\":";         j += active ? "true" : "false"; j += ",";
+  j += "\"yawDeg\":";         j += String(yawDeg,    2); j += ",";
+  j += "\"targetYawDeg\":";   j += String(tgtYawDeg, 2); j += ",";
+  j += "\"headingErrorDeg\":";j += String(hErrDeg,   2); j += ",";
+  j += "\"currentDistanceM\":"; j += String(snap_curDist, 3); j += ",";
+  j += "\"targetDistanceM\":";  j += String(snap_tgtDist, 3); j += ",";
+  j += "\"distanceErrorM\":";   j += String(snap_distErr, 3); j += ",";
+  j += "\"baseForwardRpm\":";   j += String(snap_baseRpm, 2); j += ",";
+  j += "\"turnCorrectionRPM\":";j += String(snap_turnRpm, 2); j += ",";
+  j += "\"Kp_pos\":";           j += String(snap_Kp_pos,     3); j += ",";
+  j += "\"Ki_pos\":";           j += String(snap_Ki_pos,     3); j += ",";
+  j += "\"Kp_heading_rpm\":";   j += String(snap_Kp_heading, 3); j += ",";
+  j += "\"Ki_heading_rpm_per_rad_s\":"; j += String(snap_Ki_heading, 3); j += ",";
+  j += "\"Kp_rotate_rpm\":";    j += String(snap_Kp_rotate,  3); j += ",";
+  j += "\"HEADING_TOLERANCE_DEG\":"; j += String(snap_HTOL,  2); j += ",";
+  for (int i = 0; i < WHEEL_COUNT; i++) {
+    j += "\"kpVel_"; j += String(i); j += "\":"; j += String(snap_kpVel[i], 3); j += ",";
+    j += "\"kiVel_"; j += String(i); j += "\":"; j += String(snap_kiVel[i], 3); j += ",";
+  }
+  j += "\"lastCommandResponse\":\""; j += safeLastCmd; j += "\",";
+  j += "\"fault\":\""; j += faultStr; j += "\"";
+  j += "}";
+  return j;
+}
+
+// -----------------------------
 // Setup/loop
 // -----------------------------
 /*
@@ -1132,13 +1308,11 @@ Testing plan:
 2) Test: heading on  + move 0.30
 3) If correction is wrong direction, run: hinvert
 4) Tune hkp: 20, 30, 40
-5) Tune hmax: 10, 15, 20
-6) Then test move 0.50
+5) Then test move 0.50
 
 Tuning hints:
 - If robot still curves, increase hkp slowly.
 - If robot wiggles, decrease hkp.
-- If correction is too aggressive, reduce hmax.
 - Keep robot still during IMU startup calibration.
 - Gyro-integrated yaw drifts over long runs, but is acceptable for short moves.
 */
@@ -1205,6 +1379,19 @@ void setup() {
     &microRosTaskHandle,
     0
   );
+
+  // Connect WiFi and start the tuning dashboard web server.
+  // This runs after RTOS tasks are created so the control loop is already live.
+  WiFi.begin(app_wifi::kSsid, app_wifi::kPassword);
+  {
+    int wifiAttempts = 0;
+    while (WiFi.status() != WL_CONNECTED && wifiAttempts < 20) {
+      delay(500);
+      wifiAttempts++;
+    }
+  }
+  app::configureWebControl(executeCommandLine, buildStatusJson);
+  app::beginWebControl();
 }
 
 void loop() {
@@ -1212,5 +1399,6 @@ void loop() {
   pollSerialCommands();
 #endif
   announceMotionResultIfNeeded();
+  app::pollWebControl();
   vTaskDelay(pdMS_TO_TICKS(5));
 }

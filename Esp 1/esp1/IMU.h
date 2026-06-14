@@ -70,6 +70,7 @@ public:
     float correctedGyroZRadPerSec() const;
     float gyroBiasZRadPerSec() const;
     const char* motionStateName() const;
+    float lastDtMs() const { return last_dt_s_ * 1000.0f; }
 
 private:
     bool writeRegister(std::uint8_t reg, std::uint8_t value);
@@ -90,6 +91,7 @@ private:
     float gyro_bias_z_rad_s_ = 0.0f;
     float raw_gyro_z_rad_s_ = 0.0f;
     float corrected_gyro_z_rad_s_ = 0.0f;
+    float last_dt_s_ = 0.0f;
     std::uint32_t last_update_us_ = 0U;
     std::uint32_t motion_state_since_us_ = 0U;
     MotionState motion_state_ = MotionState::STILL;

@@ -7,8 +7,9 @@
 #include "MotorDriver.h"
 #include "WheelVelocityController.h"
 
-float Kp_pos = 0.8f;
+float Kp_pos = 1.2f;
 float Ki_pos = 0.0f;
+constexpr float MAX_VX = 0.5f;
 
 bool positionModeActive = false;
 MotionMode motionMode = MODE_IDLE;
@@ -23,9 +24,7 @@ float positionIntegral = 0.0f;
 
 float baseForwardRpm = 0.0f;
 float rawBaseForwardRpm = 0.0f;
-bool minimumMoveRpmActive = false;
 std::uint32_t motionStartMs = 0U;
-std::uint32_t completionStableSinceMs = 0U;
 
 void resetPositionControllerState() {
   targetDistanceM = 0.0f;
@@ -35,7 +34,6 @@ void resetPositionControllerState() {
   positionModeActive = false;
   motionMode = MODE_IDLE;
   motionStartMs = 0U;
-  completionStableSinceMs = 0U;
 }
 
 void clearMotionFault() {
@@ -49,7 +47,6 @@ void clearMotionResult() {
 
 void beginMotionTimingWindow(std::uint32_t nowMs) {
   motionStartMs = nowMs;
-  completionStableSinceMs = 0U;
   clearMotionFault();
   clearMotionResult();
 }
@@ -92,14 +89,12 @@ void runPositionLoop(float dtSec, std::uint32_t nowMs) {
   if (!positionModeActive || motionMode != MODE_MOVE_FORWARD) {
     baseForwardRpm = 0.0f;
     rawBaseForwardRpm = 0.0f;
-    minimumMoveRpmActive = false;
     return;
   }
 
   if ((motionStartMs != 0U) && ((nowMs - motionStartMs) >= MOVE_TIMEOUT_MS)) {
     baseForwardRpm = 0.0f;
     rawBaseForwardRpm = 0.0f;
-    minimumMoveRpmActive = false;
     turnCorrectionRPM = 0.0f;
     requestMotionResult(MOTION_RESULT_FAULT, MODE_MOVE_FORWARD, MOTION_FAULT_TIMEOUT);
     return;
@@ -109,23 +104,17 @@ void runPositionLoop(float dtSec, std::uint32_t nowMs) {
 
   const bool reachedByTolerance = fabs(distanceErrorM) <= POSITION_TOLERANCE;
   if (reachedByTolerance) {
+    setAllTargetRpm(0.0f);
     baseForwardRpm = 0.0f;
     rawBaseForwardRpm = 0.0f;
-    minimumMoveRpmActive = false;
-
-    if (completionStableSinceMs == 0U) {
-      completionStableSinceMs = nowMs;
-    }
-
-    if ((nowMs - completionStableSinceMs) >= DONE_STABLE_MS) {
-      turnCorrectionRPM = 0.0f;
-      positionIntegral = 0.0f;
-      headingErrorRad = 0.0f;
-      headingIntegralRadS = 0.0f;
-      requestMotionResult(MOTION_RESULT_DONE, MODE_MOVE_FORWARD, MOTION_FAULT_NONE);
-    }
-  } else {
-    completionStableSinceMs = 0U;
+    turnCorrectionRPM = 0.0f;
+    positionIntegral = 0.0f;
+    headingErrorRad = 0.0f;
+    headingIntegralRadS = 0.0f;
+    resetVelocityControllerState();
+    stopAllMotorHardware();
+    requestMotionResult(MOTION_RESULT_DONE, MODE_MOVE_FORWARD, MOTION_FAULT_NONE);
+    return;
   }
 
   positionIntegral += distanceErrorM * dtSec;
@@ -135,13 +124,5 @@ void runPositionLoop(float dtSec, std::uint32_t nowMs) {
 
   rawBaseForwardRpm = (vxCommand / WHEEL_CIRCUMFERENCE_M) * 60.0f;
 
-  minimumMoveRpmActive = false;
-  if (reachedByTolerance) {
-    baseForwardRpm = 0.0f;
-  } else if (fabs(rawBaseForwardRpm) > 0.001f && fabs(rawBaseForwardRpm) < MIN_MOVE_RPM) {
-    baseForwardRpm = (rawBaseForwardRpm > 0.0f) ? MIN_MOVE_RPM : -MIN_MOVE_RPM;
-    minimumMoveRpmActive = true;
-  } else {
-    baseForwardRpm = rawBaseForwardRpm;
-  }
+  baseForwardRpm = rawBaseForwardRpm;
 }

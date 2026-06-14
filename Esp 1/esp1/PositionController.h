@@ -7,12 +7,9 @@
 extern float Kp_pos;
 extern float Ki_pos;
 
-constexpr float MAX_VX = 0.25f;
-constexpr float POSITION_TOLERANCE = 0.05f;
-constexpr float MIN_MOVE_RPM = 70.0f;
-constexpr std::uint32_t DONE_STABLE_MS = 300U;
-constexpr std::uint32_t MOVE_TIMEOUT_MS = 10000U;
-constexpr std::uint32_t ROTATE_TIMEOUT_MS = 8000U;
+constexpr float POSITION_TOLERANCE = 0.005f;
+constexpr std::uint32_t MOVE_TIMEOUT_MS = 250000000U;
+constexpr std::uint32_t ROTATE_TIMEOUT_MS = 150000000U;
 
 extern bool positionModeActive;
 
@@ -45,9 +42,7 @@ extern float distanceErrorM;
 extern float positionIntegral;
 extern float baseForwardRpm;
 extern float rawBaseForwardRpm;
-extern bool minimumMoveRpmActive;
 extern std::uint32_t motionStartMs;
-extern std::uint32_t completionStableSinceMs;
 
 void resetPositionControllerState();
 void clearMotionFault();

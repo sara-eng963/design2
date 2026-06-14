@@ -11,15 +11,9 @@ float previousVelocityError[WHEEL_COUNT] = {0, 0, 0, 0};
 float outputPwmUnclamped[WHEEL_COUNT] = {0, 0, 0, 0};
 int finalPwm[WHEEL_COUNT] = {0, 0, 0, 0};
 
-float kpVel[WHEEL_COUNT] = {5.0f, 5.5f, 4.5f, 5.5f};
-float kiVel[WHEEL_COUNT] = {1.15f, 1.15f, 1.15f, 1.30f};
+float kpVel[WHEEL_COUNT] = {4.0f, 4.0f, 4.5f, 5.5f};
+float kiVel[WHEEL_COUNT] = {1.5f, 2.5f, 1.5f, 1.5f};
 float kdVel[WHEEL_COUNT] = {0.0f, 0.0f, 0.0f, 0.0f};
-
-float clampWheelTargetRpm(float rpm) {
-  if (rpm > MAX_WHEEL_TARGET_RPM) return MAX_WHEEL_TARGET_RPM;
-  if (rpm < -MAX_WHEEL_TARGET_RPM) return -MAX_WHEEL_TARGET_RPM;
-  return rpm;
-}
 
 void setAllTargetRpm(float rpmValue) {
   for (int i = 0; i < WHEEL_COUNT; i++) {
@@ -50,24 +44,7 @@ void runVelocityLoopForWheel(WheelIndex wheel, float dtSec) {
     velocityDerivative[i] = 0.0f;
   }
 
-  float candidateIntegral = velocityIntegral[i] + (velocityError[i] * dtSec);
-  if (candidateIntegral > VELOCITY_INTEGRAL_LIMIT) candidateIntegral = VELOCITY_INTEGRAL_LIMIT;
-  if (candidateIntegral < -VELOCITY_INTEGRAL_LIMIT) candidateIntegral = -VELOCITY_INTEGRAL_LIMIT;
-
-  float candidateOutput =
-    (kpVel[i] * velocityError[i]) +
-    (kiVel[i] * candidateIntegral) +
-    (kdVel[i] * velocityDerivative[i]);
-
-  int candidateFinal = clampSignedPwm((int)candidateOutput);
-
-  bool blockIntegralGrowth =
-    (candidateFinal >= PWM_MAX && velocityError[i] > 0.0f) ||
-    (candidateFinal <= -PWM_MAX && velocityError[i] < 0.0f);
-
-  if (!blockIntegralGrowth) {
-    velocityIntegral[i] = candidateIntegral;
-  }
+  velocityIntegral[i] += velocityError[i] * dtSec;
 
   outputPwmUnclamped[i] =
     (kpVel[i] * velocityError[i]) +
