@@ -73,6 +73,7 @@ const char *modeToString(MotionMode mode) {
   switch (mode) {
     case MODE_MOVE_FORWARD: return "MOVE_FORWARD";
     case MODE_ROTATE_TO_HEADING: return "ROTATE_TO_HEADING";
+    case MODE_MANUAL_VELOCITY: return "MANUAL_VELOCITY";
     default: return "IDLE";
   }
 }

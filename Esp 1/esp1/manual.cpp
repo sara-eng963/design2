@@ -60,13 +60,13 @@ void runManualMixer() {
     float vy_rpm = manualVy * maxRpm;
     float wz_rpm = manualWz * maxRpm;
 
-    // Mecanum wheel mixing equations (standard)
+    // Standard mecanum wheel mixer.
     // F1 = front left, F2 = front right, R1 = rear left, R2 = rear right
     // Positive vx = forward, positive vy = strafe right, positive wz = rotate right (CW)
-    targetRpm[WHEEL_F1] = vx_rpm - vy_rpm - wz_rpm;   // front left
-    targetRpm[WHEEL_F2] = vx_rpm + vy_rpm + wz_rpm;   // front right
-    targetRpm[WHEEL_R1] = vx_rpm + vy_rpm - wz_rpm;   // rear left
-    targetRpm[WHEEL_R2] = vx_rpm - vy_rpm + wz_rpm;   // rear right
+    targetRpm[WHEEL_F1] = vx_rpm - vy_rpm - wz_rpm;
+    targetRpm[WHEEL_F2] = vx_rpm + vy_rpm + wz_rpm;
+    targetRpm[WHEEL_R1] = vx_rpm + vy_rpm - wz_rpm;
+    targetRpm[WHEEL_R2] = vx_rpm - vy_rpm + wz_rpm;
 
     // Clip each wheel RPM to [-maxRpm, maxRpm]
     for (int i = 0; i < WHEEL_COUNT; i++) {

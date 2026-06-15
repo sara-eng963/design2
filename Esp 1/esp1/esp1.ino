@@ -571,6 +571,27 @@ String buildStatusLine() {
   status += motionFaultToString(motionFaultCode);
   status += " ros=";
   status += microRosInitialized ? "1" : "0";
+  status += " manual=";
+  status += String(manualVx, 2);
+  status += ",";
+  status += String(manualVy, 2);
+  status += ",";
+  status += String(manualWz, 2);
+  status += " targetRPM=";
+  for (int i = 0; i < WHEEL_COUNT; i++) {
+    if (i > 0) status += ",";
+    status += String(targetRpm[i], 1);
+  }
+  status += " measuredRPM=";
+  for (int i = 0; i < WHEEL_COUNT; i++) {
+    if (i > 0) status += ",";
+    status += String(measuredRpm[i], 1);
+  }
+  status += " pwm=";
+  for (int i = 0; i < WHEEL_COUNT; i++) {
+    if (i > 0) status += ",";
+    status += String(appliedPwm[i]);
+  }
   const float rawGyroZDegPerSec = app::imuDriver().rawGyroZRadPerSec() * (180.0f / PI_F);
   const float correctedGyroZDegPerSec = app::imuDriver().correctedGyroZRadPerSec() * (180.0f / PI_F);
   const float gyroBiasZDegPerSec = app::imuDriver().gyroBiasZRadPerSec() * (180.0f / PI_F);
@@ -1120,7 +1141,8 @@ void controlLoopTask(void *parameter) {
 
     // Yaw is integrated inside the IMU update task.
     // The control loop only reads displayedYawRad() for control/debug.
-    if (!imuHealthy) {
+    // Manual velocity control does not depend on IMU heading feedback.
+    if (!imuHealthy && motionMode != MODE_MANUAL_VELOCITY) {
       if (motionIsActive()) {
         if (motionMode == MODE_ROTATE_TO_HEADING) {
           rotateIntegralRadS = 0.0f;
@@ -1133,7 +1155,7 @@ void controlLoopTask(void *parameter) {
     }
 
     currentHeadingRad = app::imuDriver().displayedYawRad();
-    if (!isfinite(currentHeadingRad)) {
+    if (!isfinite(currentHeadingRad) && motionMode != MODE_MANUAL_VELOCITY) {
       imuHealthy = false;
       if (motionIsActive()) {
         if (motionMode == MODE_ROTATE_TO_HEADING) {

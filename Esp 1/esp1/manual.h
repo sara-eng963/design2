@@ -6,7 +6,7 @@
 // ------------------------------------------------------------
 // Manual velocity mode configuration
 // ------------------------------------------------------------
-constexpr float MANUAL_MAX_RPM = 60.0f;          // maximum wheel RPM (user requested constant 60 RPM)
+constexpr float MANUAL_MAX_RPM = 120.0f;          // maximum wheel RPM (user requested constant 60 RPM)
 constexpr unsigned long MANUAL_WATCHDOG_MS = 250; // stop after 250 ms without command
 
 // ------------------------------------------------------------
