@@ -13,6 +13,7 @@
 #include <std_msgs/msg/string.h>
 
 #include "EncoderManager.h"
+#include "Estop.h"
 #include "HardwareConfig.h"
 #include "HeadingController.h"
 #include "IMU.h"
@@ -100,9 +101,9 @@ rcl_allocator_t allocator = rcl_get_default_allocator();
 rcl_node_t node = rcl_get_zero_initialized_node();
 rclc_executor_t executor = {};
 
-static char drive_status_buffer[384];
+static char drive_status_buffer[1024];
 static char drive_cmd_buffer[128];
-constexpr std::size_t DRIVE_STATUS_QUEUE_DEPTH = 8U;
+constexpr std::size_t DRIVE_STATUS_QUEUE_DEPTH = 12U;
 static char drive_status_queue[DRIVE_STATUS_QUEUE_DEPTH][sizeof(drive_status_buffer)];
 std::size_t driveStatusQueueHead = 0U;
 std::size_t driveStatusQueueTail = 0U;
@@ -138,6 +139,8 @@ bool dequeueDriveStatus(String &text);
 void clearDriveStatusQueue();
 void clearInterruptedMoveState();
 void captureInterruptedMoveIfNeeded();
+void queueMoveInitDebug(float distanceM);
+void queueMoveStartDebug(float distanceM, float headingDeg);
 
 // -----------------------------
 // Utility helpers
@@ -371,6 +374,10 @@ bool createMicroRosEntities() {
     return false;
   }
 
+  if (!createEStopPublisher(&node)) {
+    return false;
+  }
+
   if (!microRosCheckOk(
         rclc_subscription_init_default(
           &drive_cmd_sub,
@@ -407,6 +414,7 @@ void destroyMicroRosEntities() {
   if (drive_cmd_sub.impl != nullptr) {
     (void)rcl_subscription_fini(&drive_cmd_sub, &node);
   }
+  destroyEStopPublisher(&node);
   if (drive_status_pub.impl != nullptr) {
     (void)rcl_publisher_fini(&drive_status_pub, &node);
   }
@@ -421,6 +429,7 @@ void destroyMicroRosEntities() {
   }
 
   drive_status_pub = rcl_get_zero_initialized_publisher();
+  resetEStopPublisher();
   drive_cmd_sub = rcl_get_zero_initialized_subscription();
   node = rcl_get_zero_initialized_node();
   support = {};
@@ -457,6 +466,7 @@ void microRosTask(void *parameter) {
       case MICRO_ROS_AGENT_AVAILABLE:
         if (createMicroRosEntities()) {
           clearDriveStatusQueue();
+          prepareEStopInitialPublish();
           state = MICRO_ROS_AGENT_CONNECTED;
         } else {
           destroyMicroRosEntities();
@@ -473,6 +483,7 @@ void microRosTask(void *parameter) {
 
         String queuedStatus;
         (void)rclc_executor_spin_some(&executor, RCL_MS_TO_NS(1));
+        pollEStopPublisher();
         while (dequeueDriveStatus(queuedStatus)) {
           (void)publishDriveStatus(queuedStatus);
         }
@@ -484,6 +495,7 @@ void microRosTask(void *parameter) {
       case MICRO_ROS_AGENT_DISCONNECTED:
         destroyMicroRosEntities();
         clearDriveStatusQueue();
+        set_microros_transports();
         vTaskDelay(MICRO_ROS_CONNECTED_PING_DELAY_TICKS);
         state = MICRO_ROS_WAITING_AGENT;
         break;
@@ -608,6 +620,113 @@ String buildStatusLine() {
   return status;
 }
 
+void appendFloatCsv(String &text, const float values[], int count, int decimals) {
+  for (int i = 0; i < count; i++) {
+    if (i > 0) text += ",";
+    text += String(values[i], decimals);
+  }
+}
+
+void appendIntCsv(String &text, const int values[], int count) {
+  for (int i = 0; i < count; i++) {
+    if (i > 0) text += ",";
+    text += String(values[i]);
+  }
+}
+
+void appendLongCsv(String &text, const long values[], int count) {
+  for (int i = 0; i < count; i++) {
+    if (i > 0) text += ",";
+    text += String(values[i]);
+  }
+}
+
+String buildMoveDebugLine(const char *tag, std::uint32_t nowMs) {
+  const float yawDeg = radToDeg(currentHeadingRad);
+  const float targetHeadingDeg = radToDeg(targetHeadingRad);
+  const float headingErrDeg = radToDeg(headingErrorRad);
+  const std::uint32_t elapsedMs = (motionStartMs == 0U) ? 0U : (nowMs - motionStartMs);
+
+  String msg = String("DEBUG ") + tag;
+  msg.reserve(900);
+  msg += " mode=";
+  msg += modeToString(motionMode);
+  msg += " active=";
+  msg += motionIsActive() ? "1" : "0";
+  msg += " now=";
+  msg += String(nowMs);
+  msg += " motionStartMs=";
+  msg += String(motionStartMs);
+  msg += " elapsed=";
+  msg += String(elapsedMs);
+  msg += " currentDistanceM=";
+  msg += String(currentDistanceM, 4);
+  msg += " targetDistanceM=";
+  msg += String(targetDistanceM, 4);
+  msg += " distanceErrorM=";
+  msg += String(distanceErrorM, 4);
+  msg += " baseForwardRpm=";
+  msg += String(baseForwardRpm, 2);
+  msg += " rawBaseForwardRpm=";
+  msg += String(rawBaseForwardRpm, 2);
+  msg += " headingDeg=";
+  msg += String(yawDeg, 2);
+  msg += " targetHeadingDeg=";
+  msg += String(targetHeadingDeg, 2);
+  msg += " headingErrDeg=";
+  msg += String(headingErrDeg, 2);
+  msg += " pwm=";
+  appendIntCsv(msg, appliedPwm, WHEEL_COUNT);
+  msg += " targetRPM=";
+  appendFloatCsv(msg, targetRpm, WHEEL_COUNT, 2);
+  msg += " measuredRPM=";
+  appendFloatCsv(msg, measuredRpm, WHEEL_COUNT, 2);
+  msg += " deltaCounts=";
+  appendLongCsv(msg, lastDeltaCounts, WHEEL_COUNT);
+  msg += " fault=";
+  msg += motionFaultToString(motionFaultCode);
+  return msg;
+}
+
+void reportMoveTimeoutDebug(std::uint32_t nowMs) {
+  String msg = buildMoveDebugLine("MOVE_TIMEOUT", nowMs);
+  Serial.println(msg);
+  (void)queueDriveStatus(msg);
+}
+
+void queueMoveInitDebug(float distanceM) {
+  String msg = "DEBUG MOVE_INIT_RESET clearAllMotionNotifications=1 currentDistanceM=";
+  msg.reserve(240);
+  msg += String(currentDistanceM, 4);
+  msg += " targetDistanceM=";
+  msg += String(targetDistanceM, 4);
+  msg += " commandedDistanceM=";
+  msg += String(distanceM, 4);
+  msg += " motionStartMs=";
+  msg += String(motionStartMs);
+  msg += " fault=";
+  msg += motionFaultToString(motionFaultCode);
+  (void)queueDriveStatus(msg);
+}
+
+void queueMoveStartDebug(float distanceM, float headingDeg) {
+  String msg = String("DEBUG MOVE_START distance=") + String(distanceM, 4);
+  msg.reserve(320);
+  msg += " heading=";
+  msg += String(headingDeg, 2);
+  msg += " now=";
+  msg += String(millis());
+  msg += " motionStartMs=";
+  msg += String(motionStartMs);
+  msg += " currentDistanceM=";
+  msg += String(currentDistanceM, 4);
+  msg += " targetDistanceM=";
+  msg += String(targetDistanceM, 4);
+  msg += " fault=";
+  msg += motionFaultToString(motionFaultCode);
+  (void)queueDriveStatus(msg);
+}
+
 void announceMotionResultIfNeeded() {
   String report;
 
@@ -713,6 +832,7 @@ bool initializeNewMove(float distanceM, bool useManualHeading, float manualHeadi
 
   // MOVE completes on the first control cycle inside the 5 mm tolerance.
   beginMotionTimingWindow(millis());
+  queueMoveInitDebug(distanceM);
   return true;
 }
 
@@ -815,6 +935,7 @@ bool executeCommandLine(const String &commandLine, String &response) {
       lastCommandResponse = response;
       return false;
     } else {
+      queueMoveStartDebug(distanceM, headingDeg);
       response = String("ACK MOVE distance=") + String(distanceM, 2) + " heading=" + String(headingDeg, 1);
     }
     lastCommandResponse = response;
@@ -1404,6 +1525,7 @@ void setup() {
   configureMotorPinsSafe();
   stopAllMotorHardware();
   configureEncoderPins();
+  configureEStopPin();
 
   microRosPublishMutex = xSemaphoreCreateMutex();
   driveStatusQueueMutex = xSemaphoreCreateMutex();

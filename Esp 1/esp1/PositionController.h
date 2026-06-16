@@ -50,6 +50,7 @@ void clearMotionFault();
 void clearMotionResult();
 void beginMotionTimingWindow(std::uint32_t nowMs);
 void requestMotionResult(MotionResultCode result, MotionMode mode, MotionFaultCode fault);
+void reportMoveTimeoutDebug(std::uint32_t nowMs);
 bool motionIsActive();
 float deltaCountsToDistanceMeters(long deltaCount);
 const char *modeToString(MotionMode mode);

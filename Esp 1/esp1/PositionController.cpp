@@ -94,6 +94,7 @@ void runPositionLoop(float dtSec, std::uint32_t nowMs) {
   }
 
   if ((motionStartMs != 0U) && ((nowMs - motionStartMs) >= MOVE_TIMEOUT_MS)) {
+    reportMoveTimeoutDebug(nowMs);
     baseForwardRpm = 0.0f;
     rawBaseForwardRpm = 0.0f;
     turnCorrectionRPM = 0.0f;

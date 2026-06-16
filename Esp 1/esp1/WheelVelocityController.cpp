@@ -11,7 +11,8 @@ float previousVelocityError[WHEEL_COUNT] = {0, 0, 0, 0};
 float outputPwmUnclamped[WHEEL_COUNT] = {0, 0, 0, 0};
 int finalPwm[WHEEL_COUNT] = {0, 0, 0, 0};
 
-float kpVel[WHEEL_COUNT] = {6.5f, 6.5f, 7.0f, 6.5f};
+// Per-wheel velocity PID gains (same defaults as velocity test; can tune later)
+float kpVel[WHEEL_COUNT] = {6.5f, 7.0f, 7.0f, 7.0f};
 float kiVel[WHEEL_COUNT] = {0.15f, 0.15f, 0.15f, 0.15f};
 float kdVel[WHEEL_COUNT] = {0.0f, 0.0f, 0.0f, 0.0f};
 
