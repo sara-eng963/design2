@@ -9,10 +9,15 @@
 #include <rcl/rcl.h>
 #include <rclc/rclc.h>
 #include <rclc/executor.h>
+#include <rmw_microros/rmw_microros.h>
 
 #include <std_msgs/msg/int32.h>
 #include <std_msgs/msg/string.h>
 #include <std_msgs/msg/float32.h>
+
+// USB Serial is used by micro-ROS as binary transport. Keep debug text off it.
+#define DEBUG_PRINT(x) do {} while (0)
+#define DEBUG_PRINTLN(x) do {} while (0)
 
 // =============================================================================
 // PIN CONFIGURATION
@@ -43,16 +48,17 @@
 #define VOLTAGE_PIN 34
 
 #define GRIPPER_SERVO_PIN 14
-#define GRIPPER_OPEN_ANGLE 180
-#define GRIPPER_CLOSE_ANGLE 115
+#define GRIPPER_OPEN_ANGLE 157
+#define GRIPPER_CLOSE_ANGLE 80
 
 #define LOCK_SERVO_PIN 33
 #define LOCK_OPEN_ANGLE 0
 #define LOCK_CLOSE_ANGLE 90
 
 #define LID_SERVO_PIN 32
-#define LID_OPEN_ANGLE 90
-#define LID_CLOSE_ANGLE 0
+#define LID_OPEN_ANGLE 50
+#define LID_CLOSE_ANGLE 145
+#define LID_SWEEP_DELAY_MS 15
 
 // =============================================================================
 // ULTRASONIC CONFIGURATION
@@ -60,18 +66,22 @@
 
 // Lower than 30000 to avoid blocking too long.
 // 15000 us roughly covers around 2.5 m max distance.
-const unsigned long TIMEOUT_US = 15000;
+const unsigned long TIMEOUT_US = 4000;
 
 const float OBSTACLE_THRESHOLD_CM = 40.0;
 
 // Time between triggering different sensors.
 // Reduces ultrasonic cross-talk.
-const int SENSOR_GAP_MS = 30;
+const int SENSOR_GAP_MS = 10;
 
 // Sensor task period.
 // ESP2 publishes obstacle status every 100 ms.
-const int SENSOR_TASK_PERIOD_MS = 100;
-const int MICROROS_PUBLISH_PERIOD_MS = 100;
+const int SENSOR_TASK_PERIOD_MS = 50;
+const int MICROROS_PUBLISH_PERIOD_MS = 50;
+constexpr TickType_t MICRO_ROS_TASK_DELAY_TICKS = pdMS_TO_TICKS(2);
+constexpr TickType_t MICRO_ROS_WAITING_AGENT_DELAY_TICKS = pdMS_TO_TICKS(500);
+constexpr TickType_t MICRO_ROS_CONNECTED_PING_DELAY_TICKS = pdMS_TO_TICKS(200);
+constexpr TickType_t MICRO_ROS_INITIAL_STARTUP_DELAY_TICKS = pdMS_TO_TICKS(2000);
 
 const float VOLTAGE_R1 = 30000.0;
 const float VOLTAGE_R2 = 7500.0;
@@ -92,7 +102,7 @@ const int CLEAR_CONFIRM_COUNT = 2;
 volatile long encoderCount = 0;
 
 const long ZERO_TICKS = 0;
-const long NINETY_DEG_TICKS = -2580;
+const long NINETY_DEG_TICKS = -2500;
 
 float Kp = 1.00;
 float Ki = 0.00;
@@ -112,6 +122,7 @@ bool MOTOR_INVERT = true;
 
 bool pidEnabled = false;
 bool homed = false;
+volatile int activePositionCmd = 999;
 
 SemaphoreHandle_t obstacleMutex;
 
@@ -134,52 +145,122 @@ SemaphoreHandle_t voltageMutex;
 float latestVoltage = 0.0;
 
 SemaphoreHandle_t gripperMutex;
-char latestGripperCmd[16] = "close";
+char latestGripperCmd[32] = "close_gripper";
 bool newGripperCmdAvailable = false;
 
 Servo gripperServo;
 Servo lockServo;
 Servo lidServo;
+int currentLidAngle = LID_CLOSE_ANGLE;
 
 // =============================================================================
 // MICRO-ROS OBJECTS
 // =============================================================================
 
-rcl_publisher_t obstaclePublisher;
+rcl_publisher_t obstaclePublisher = rcl_get_zero_initialized_publisher();
 std_msgs__msg__Int32 obstacleMsg;
 
-rcl_publisher_t voltagePublisher;
+rcl_publisher_t voltagePublisher = rcl_get_zero_initialized_publisher();
 std_msgs__msg__Float32 voltageMsg;
 
-rcl_subscription_t positionCmdSubscriber;
+rcl_publisher_t esp2StatusPublisher = rcl_get_zero_initialized_publisher();
+std_msgs__msg__String esp2StatusMsg;
+char esp2StatusMsgBuffer[32];
+
+rcl_subscription_t positionCmdSubscriber = rcl_get_zero_initialized_subscription();
 std_msgs__msg__Int32 positionCmdMsg;
 
-rcl_subscription_t trafficCmdSubscriber;
+rcl_subscription_t trafficCmdSubscriber = rcl_get_zero_initialized_subscription();
 std_msgs__msg__String trafficCmdMsg;
 char trafficCmdBuffer[8];
 
-rcl_subscription_t gripperCmdSubscriber;
+rcl_subscription_t gripperCmdSubscriber = rcl_get_zero_initialized_subscription();
 std_msgs__msg__String gripperCmdMsg;
-char gripperCmdBuffer[16];
+char gripperCmdBuffer[32];
 
-rclc_executor_t executor;
+rclc_executor_t executor = rclc_executor_get_zero_initialized_executor();
 
-rclc_support_t support;
-rcl_allocator_t allocator;
-rcl_node_t node;
+rclc_support_t support = {};
+rcl_allocator_t allocator = rcl_get_default_allocator();
+rcl_node_t node = rcl_get_zero_initialized_node();
+bool microRosInitialized = false;
+
+enum MicroRosConnectionState
+{
+  MICRO_ROS_WAITING_AGENT,
+  MICRO_ROS_AGENT_AVAILABLE,
+  MICRO_ROS_AGENT_CONNECTED,
+  MICRO_ROS_AGENT_DISCONNECTED,
+};
+
+typedef struct
+{
+  char text[32];
+} Esp2StatusEvent;
+
+QueueHandle_t esp2StatusQueue;
 
 // =============================================================================
 // ERROR HANDLING
 // =============================================================================
 
-#define RCCHECK(fn) { rcl_ret_t temp_rc = fn; if ((temp_rc != RCL_RET_OK)) { errorLoop(); } }
 #define RCSOFTCHECK(fn) { rcl_ret_t temp_rc = fn; (void)temp_rc; }
 
-void errorLoop()
+void queueEsp2Status(const char *status)
 {
-  while (1)
+  if (esp2StatusQueue == NULL || status == NULL)
   {
-    delay(100);
+    return;
+  }
+
+  Esp2StatusEvent event;
+  strncpy(event.text, status, sizeof(event.text));
+  event.text[sizeof(event.text) - 1] = '\0';
+
+  (void)xQueueSend(esp2StatusQueue, &event, 0);
+}
+
+const char *gripperStatusForCommand(const char *cmd)
+{
+  if (strcmp(cmd, "open_gripper") == 0)
+  {
+    return "opened gripper";
+  }
+  else if (strcmp(cmd, "close_gripper") == 0)
+  {
+    return "closed gripper";
+  }
+  else if (strcmp(cmd, "open_lock") == 0)
+  {
+    return "opened lock";
+  }
+  else if (strcmp(cmd, "close_lock") == 0)
+  {
+    return "closed lock";
+  }
+  else if (strcmp(cmd, "open_lid") == 0)
+  {
+    return "opened lid";
+  }
+  else if (strcmp(cmd, "close_lid") == 0)
+  {
+    return "closed lid";
+  }
+
+  return NULL;
+}
+
+void queuePositionReachedStatus()
+{
+  if (activePositionCmd == 90)
+  {
+    queueEsp2Status("position 90 reached");
+    activePositionCmd = 999;
+  }
+  else if (activePositionCmd == 0)
+  {
+    queueEsp2Status("position 0 reached");
+    activePositionCmd = 999;
   }
 }
 
@@ -238,68 +319,90 @@ float readInputVoltage()
   return vin;
 }
 
+void moveLidToAngle(int targetAngle)
+{
+  targetAngle = constrain(targetAngle, 0, 180);
+
+  if (targetAngle > currentLidAngle)
+  {
+    for (int pos = currentLidAngle; pos <= targetAngle; pos++)
+    {
+      lidServo.write(pos);
+      delay(LID_SWEEP_DELAY_MS);
+    }
+  }
+  else
+  {
+    lidServo.write(targetAngle);
+  }
+
+  currentLidAngle = targetAngle;
+}
+
 void setupGripperServo()
 {
-  gripperServo.setPeriodHertz(50);
-  gripperServo.attach(GRIPPER_SERVO_PIN, 500, 2400);
-  gripperServo.write(GRIPPER_CLOSE_ANGLE);
+  gripperServo.attach(GRIPPER_SERVO_PIN);
+  gripperServo.write(GRIPPER_OPEN_ANGLE);
 
-  lockServo.setPeriodHertz(50);
-  lockServo.attach(LOCK_SERVO_PIN, 500, 2400);
-  lockServo.write(LOCK_CLOSE_ANGLE);
+  lockServo.attach(LOCK_SERVO_PIN);
+  lockServo.write(LOCK_OPEN_ANGLE);
 
-  lidServo.setPeriodHertz(50);
-  lidServo.attach(LID_SERVO_PIN, 500, 2400);
+  lidServo.attach(LID_SERVO_PIN);
   lidServo.write(LID_CLOSE_ANGLE);
+  currentLidAngle = LID_CLOSE_ANGLE;
 }
 
 void applyGripperCommand(const char *cmd)
 {
-  if (strcmp(cmd, "open") == 0)
+  if (strcmp(cmd, "open_gripper") == 0)
   {
-    Serial.print("Applying gripper command: ");
-    Serial.print(cmd);
-    Serial.print(" -> angle ");
-    Serial.println(GRIPPER_OPEN_ANGLE);
     gripperServo.write(GRIPPER_OPEN_ANGLE);
   }
-  else if (strcmp(cmd, "close") == 0)
+  else if (strcmp(cmd, "close_gripper") == 0)
   {
-    Serial.print("Applying gripper command: ");
-    Serial.print(cmd);
-    Serial.print(" -> angle ");
-    Serial.println(GRIPPER_CLOSE_ANGLE);
     gripperServo.write(GRIPPER_CLOSE_ANGLE);
   }
   else if (strcmp(cmd, "open_lock") == 0)
   {
-    Serial.println("Applying gripper command: open_lock");
     lockServo.write(LOCK_OPEN_ANGLE);
-    Serial.println("LOCK_OPENED");
   }
   else if (strcmp(cmd, "close_lock") == 0)
   {
-    Serial.println("Applying gripper command: close_lock");
     lockServo.write(LOCK_CLOSE_ANGLE);
-    Serial.println("LOCK_CLOSED");
   }
   else if (strcmp(cmd, "open_lid") == 0)
   {
-    Serial.println("Applying gripper command: open_lid");
-    lidServo.write(LID_OPEN_ANGLE);
-    Serial.println("LID_OPENED");
+    moveLidToAngle(LID_OPEN_ANGLE);
   }
   else if (strcmp(cmd, "close_lid") == 0)
   {
-    Serial.println("Applying gripper command: close_lid");
-    lidServo.write(LID_CLOSE_ANGLE);
-    Serial.println("LID_CLOSED");
+    moveLidToAngle(LID_CLOSE_ANGLE);
   }
 }
 
 // =============================================================================
 // PROTECTED MOTOR PID MODULE
 // =============================================================================
+
+void setupMotor()
+{
+  pinMode(PWM_PIN, OUTPUT);
+  pinMode(IN1_PIN, OUTPUT);
+  pinMode(IN2_PIN, OUTPUT);
+
+  // Same PWM style as the proven working gripper+motor sketch.
+  // setup() attaches servos before this function is called.
+  analogWrite(PWM_PIN, 0);
+
+  digitalWrite(IN1_PIN, LOW);
+  digitalWrite(IN2_PIN, LOW);
+}
+
+void setMotorPwm(int pwm)
+{
+  pwm = constrain(pwm, 0, 255);
+  analogWrite(PWM_PIN, pwm);
+}
 
 void moveMotorPositive(int pwm)
 {
@@ -314,7 +417,7 @@ void moveMotorPositive(int pwm)
     digitalWrite(IN2_PIN, HIGH);
   }
 
-  analogWrite(PWM_PIN, pwm);
+  setMotorPwm(pwm);
 }
 
 void moveMotorNegative(int pwm)
@@ -330,12 +433,12 @@ void moveMotorNegative(int pwm)
     digitalWrite(IN2_PIN, LOW);
   }
 
-  analogWrite(PWM_PIN, pwm);
+  setMotorPwm(pwm);
 }
 
 void stopMotor()
 {
-  analogWrite(PWM_PIN, 0);
+  setMotorPwm(0);
 
   digitalWrite(IN1_PIN, LOW);
   digitalWrite(IN2_PIN, LOW);
@@ -392,9 +495,10 @@ void runPID()
   {
     stopMotor();
     pidEnabled = false;
+    queuePositionReachedStatus();
 
-    Serial.print("Target reached. Position = ");
-    Serial.println(currentPosition);
+    DEBUG_PRINT("Target reached. Position = ");
+    DEBUG_PRINTLN(currentPosition);
 
     return;
   }
@@ -425,29 +529,29 @@ void runPID()
   {
     lastPrint = millis();
 
-    Serial.print("Target: ");
-    Serial.print(targetTicks);
+    DEBUG_PRINT("Target: ");
+    DEBUG_PRINT(targetTicks);
 
-    Serial.print(" | Pos: ");
-    Serial.print(currentPosition);
+    DEBUG_PRINT(" | Pos: ");
+    DEBUG_PRINT(currentPosition);
 
-    Serial.print(" | Error: ");
-    Serial.print(error);
+    DEBUG_PRINT(" | Error: ");
+    DEBUG_PRINT(error);
 
-    Serial.print(" | PID Output: ");
-    Serial.print(output);
+    DEBUG_PRINT(" | PID Output: ");
+    DEBUG_PRINT(output);
 
-    Serial.print(" | PWM: ");
-    Serial.print(pwm);
+    DEBUG_PRINT(" | PWM: ");
+    DEBUG_PRINT(pwm);
 
-    Serial.print(" | Kp: ");
-    Serial.print(Kp);
+    DEBUG_PRINT(" | Kp: ");
+    DEBUG_PRINT(Kp);
 
-    Serial.print(" Ki: ");
-    Serial.print(Ki);
+    DEBUG_PRINT(" Ki: ");
+    DEBUG_PRINT(Ki);
 
-    Serial.print(" Kd: ");
-    Serial.println(Kd);
+    DEBUG_PRINT(" Kd: ");
+    DEBUG_PRINTLN(Kd);
   }
 }
 
@@ -456,6 +560,7 @@ void checkHomeLimit()
   if (digitalRead(LIMIT_PIN) == HIGH)
   {
     long pos = getEncoderCount();
+    bool homeTargetCompleted = false;
 
     if (pidEnabled && targetTicks == ZERO_TICKS)
     {
@@ -465,8 +570,11 @@ void checkHomeLimit()
 
       pidEnabled = false;
       homed = true;
+      queueEsp2Status("position 0 reached");
+      activePositionCmd = 999;
+      homeTargetCompleted = true;
 
-      Serial.println("Home reached. Encoder zeroed.");
+      DEBUG_PRINTLN("Home reached. Encoder zeroed.");
     }
 
     if (pos > 50)
@@ -474,8 +582,13 @@ void checkHomeLimit()
       stopMotor();
       pidEnabled = false;
       zeroEncoder();
+      if (!homeTargetCompleted && activePositionCmd == 0)
+      {
+        queueEsp2Status("position 0 reached");
+        activePositionCmd = 999;
+      }
 
-      Serial.println("Limit safety stop. Encoder zeroed.");
+      DEBUG_PRINTLN("Limit safety stop. Encoder zeroed.");
     }
   }
 }
@@ -489,23 +602,29 @@ void positionCmdCallback(const void *msgin)
   {
     targetTicks = NINETY_DEG_TICKS;
     resetPID();
+    activePositionCmd = 90;
     pidEnabled = true;
   }
   else if (cmd == 0)
   {
     targetTicks = ZERO_TICKS;
     resetPID();
+    activePositionCmd = 0;
     pidEnabled = true;
   }
   else if (cmd == -1)
   {
     pidEnabled = false;
+    activePositionCmd = 999;
     stopMotor();
+    queueEsp2Status("position stopped");
   }
   else if (cmd == -2)
   {
     zeroEncoder();
     resetPID();
+    activePositionCmd = 999;
+    queueEsp2Status("encoder zeroed");
   }
 }
 
@@ -539,7 +658,7 @@ void trafficCmdCallback(const void *msgin)
   }
   else
   {
-    Serial.println("Invalid traffic command");
+    DEBUG_PRINTLN("Invalid traffic command");
     return;
   }
 
@@ -560,7 +679,7 @@ void gripperCmdCallback(const void *msgin)
     return;
   }
 
-  char temp[16];
+  char temp[32];
   size_t copyLen = msg->data.size;
 
   if (copyLen >= sizeof(temp))
@@ -571,32 +690,16 @@ void gripperCmdCallback(const void *msgin)
   memcpy(temp, msg->data.data, copyLen);
   temp[copyLen] = '\0';
 
-  for (size_t i = 0; temp[i] != '\0'; i++)
-  {
-    temp[i] = (char)tolower((unsigned char)temp[i]);
-  }
-
-  if (strcmp(temp, "open_gripper") == 0)
-  {
-    strncpy(temp, "open", sizeof(temp));
-    temp[sizeof(temp) - 1] = '\0';
-  }
-  else if (strcmp(temp, "close_gripper") == 0)
-  {
-    strncpy(temp, "close", sizeof(temp));
-    temp[sizeof(temp) - 1] = '\0';
-  }
-  else if (
+  bool validCommand =
+    strcmp(temp, "open_gripper") == 0 ||
+    strcmp(temp, "close_gripper") == 0 ||
     strcmp(temp, "open_lock") == 0 ||
     strcmp(temp, "close_lock") == 0 ||
     strcmp(temp, "open_lid") == 0 ||
-    strcmp(temp, "close_lid") == 0)
+    strcmp(temp, "close_lid") == 0;
+
+  if (!validCommand)
   {
-    // Keep the command as-is for lock/lid dispatch in gripperTask.
-  }
-  else
-  {
-    Serial.println("Invalid gripper command");
     return;
   }
 
@@ -605,13 +708,7 @@ void gripperCmdCallback(const void *msgin)
     strncpy(latestGripperCmd, temp, sizeof(latestGripperCmd));
     latestGripperCmd[sizeof(latestGripperCmd) - 1] = '\0';
     newGripperCmdAvailable = true;
-    Serial.print("Gripper command accepted: ");
-    Serial.println(latestGripperCmd);
     xSemaphoreGive(gripperMutex);
-  }
-  else
-  {
-    Serial.println("Gripper command dropped: mutex timeout");
   }
 }
 
@@ -846,7 +943,7 @@ void gripperTask(void *parameter)
 {
   while (1)
   {
-    char cmdToApply[16];
+    char cmdToApply[32];
     bool shouldApply = false;
 
     if (xSemaphoreTake(gripperMutex, pdMS_TO_TICKS(10)) == pdTRUE)
@@ -865,6 +962,12 @@ void gripperTask(void *parameter)
     if (shouldApply)
     {
       applyGripperCommand(cmdToApply);
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      const char *status = gripperStatusForCommand(cmdToApply);
+      if (status != NULL)
+      {
+        queueEsp2Status(status);
+      }
     }
 
     vTaskDelay(pdMS_TO_TICKS(20));
@@ -875,116 +978,241 @@ void gripperTask(void *parameter)
 // TASK 2: MICRO-ROS PUBLISHER TASK
 // =============================================================================
 
-void microRosTask(void *parameter)
+bool microRosCheckOk(rcl_ret_t rc)
 {
-  set_microros_transports();
+  return rc == RCL_RET_OK;
+}
 
-  delay(2000);
+void clearEsp2StatusQueue()
+{
+  if (esp2StatusQueue != NULL)
+  {
+    xQueueReset(esp2StatusQueue);
+  }
+}
 
-  allocator = rcl_get_default_allocator();
-
-  RCCHECK(rclc_support_init(&support, 0, NULL, &allocator));
-
-  RCCHECK(rclc_node_init_default(
-    &node,
-    "esp2_mission_hardware",
-    "",
-    &support
-  ));
-
-  RCCHECK(rclc_publisher_init_default(
-    &obstaclePublisher,
-    &node,
-    ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32),
-    "/obstacle_status"
-  ));
-
-  RCCHECK(rclc_publisher_init_default(
-    &voltagePublisher,
-    &node,
-    ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32),
-    "/esp2/voltage"
-  ));
-
-  RCCHECK(rclc_subscription_init_default(
-    &positionCmdSubscriber,
-    &node,
-    ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32),
-    "/esp2/position_cmd"
-  ));
+bool createMicroRosEntities()
+{
+  esp2StatusMsg.data.data = esp2StatusMsgBuffer;
+  esp2StatusMsg.data.size = 0;
+  esp2StatusMsg.data.capacity = sizeof(esp2StatusMsgBuffer);
 
   trafficCmdMsg.data.data = trafficCmdBuffer;
   trafficCmdMsg.data.size = 0;
   trafficCmdMsg.data.capacity = sizeof(trafficCmdBuffer);
 
-  RCCHECK(rclc_subscription_init_default(
-    &trafficCmdSubscriber,
-    &node,
-    ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, String),
-    "/esp2/traffic_cmd"
-  ));
-
   gripperCmdMsg.data.data = gripperCmdBuffer;
   gripperCmdMsg.data.size = 0;
   gripperCmdMsg.data.capacity = sizeof(gripperCmdBuffer);
 
-  RCCHECK(rclc_subscription_init_default(
-    &gripperCmdSubscriber,
-    &node,
-    ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, String),
-    "/esp2/gripper_cmd"
-  ));
+  allocator = rcl_get_default_allocator();
+  executor = rclc_executor_get_zero_initialized_executor();
 
-  RCCHECK(rclc_executor_init(&executor, &support.context, 3, &allocator));
-
-  RCCHECK(rclc_executor_add_subscription(
-    &executor,
-    &positionCmdSubscriber,
-    &positionCmdMsg,
-    &positionCmdCallback,
-    ON_NEW_DATA
-  ));
-
-  RCCHECK(rclc_executor_add_subscription(
-    &executor,
-    &trafficCmdSubscriber,
-    &trafficCmdMsg,
-    &trafficCmdCallback,
-    ON_NEW_DATA
-  ));
-
-  RCCHECK(rclc_executor_add_subscription(
-    &executor,
-    &gripperCmdSubscriber,
-    &gripperCmdMsg,
-    &gripperCmdCallback,
-    ON_NEW_DATA
-  ));
-
-  TickType_t lastWakeTime = xTaskGetTickCount();
-  const TickType_t periodTicks = pdMS_TO_TICKS(MICROROS_PUBLISH_PERIOD_MS);
-
-  while (1)
+  if (!microRosCheckOk(rclc_support_init(&support, 0, NULL, &allocator)))
   {
-    static unsigned long lastVoltagePublish = 0;
+    return false;
+  }
 
-    RCSOFTCHECK(rclc_executor_spin_some(&executor, RCL_MS_TO_NS(5)));
+  if (!microRosCheckOk(rclc_node_init_default(&node, "esp2_mission_hardware", "", &support)))
+  {
+    return false;
+  }
 
-    if (millis() - lastVoltagePublish >= VOLTAGE_PUBLISH_PERIOD_MS)
+  if (!microRosCheckOk(
+        rclc_publisher_init_default(
+          &obstaclePublisher,
+          &node,
+          ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32),
+          "/obstacle_status")))
+  {
+    return false;
+  }
+
+  if (!microRosCheckOk(
+        rclc_publisher_init_default(
+          &voltagePublisher,
+          &node,
+          ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32),
+          "/esp2/voltage")))
+  {
+    return false;
+  }
+
+  if (!microRosCheckOk(
+        rclc_publisher_init_default(
+          &esp2StatusPublisher,
+          &node,
+          ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, String),
+          "/esp2_status")))
+  {
+    return false;
+  }
+
+  if (!microRosCheckOk(
+        rclc_subscription_init_default(
+          &positionCmdSubscriber,
+          &node,
+          ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32),
+          "/esp2/position_cmd")))
+  {
+    return false;
+  }
+
+  if (!microRosCheckOk(
+        rclc_subscription_init_default(
+          &trafficCmdSubscriber,
+          &node,
+          ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, String),
+          "/esp2/traffic_cmd")))
+  {
+    return false;
+  }
+
+  if (!microRosCheckOk(
+        rclc_subscription_init_default(
+          &gripperCmdSubscriber,
+          &node,
+          ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, String),
+          "/esp2/gripper_cmd")))
+  {
+    return false;
+  }
+
+  if (!microRosCheckOk(rclc_executor_init(&executor, &support.context, 3, &allocator)))
+  {
+    return false;
+  }
+
+  if (!microRosCheckOk(
+        rclc_executor_add_subscription(
+          &executor,
+          &positionCmdSubscriber,
+          &positionCmdMsg,
+          &positionCmdCallback,
+          ON_NEW_DATA)))
+  {
+    return false;
+  }
+
+  if (!microRosCheckOk(
+        rclc_executor_add_subscription(
+          &executor,
+          &trafficCmdSubscriber,
+          &trafficCmdMsg,
+          &trafficCmdCallback,
+          ON_NEW_DATA)))
+  {
+    return false;
+  }
+
+  if (!microRosCheckOk(
+        rclc_executor_add_subscription(
+          &executor,
+          &gripperCmdSubscriber,
+          &gripperCmdMsg,
+          &gripperCmdCallback,
+          ON_NEW_DATA)))
+  {
+    return false;
+  }
+
+  microRosInitialized = true;
+  return true;
+}
+
+void destroyMicroRosEntities()
+{
+  if (microRosInitialized)
+  {
+    rmw_context_t *rmwContext = rcl_context_get_rmw_context(&support.context);
+    (void)rmw_uros_set_context_entity_destroy_session_timeout(rmwContext, 0);
+  }
+
+  if (positionCmdSubscriber.impl != NULL)
+  {
+    (void)rcl_subscription_fini(&positionCmdSubscriber, &node);
+  }
+  if (trafficCmdSubscriber.impl != NULL)
+  {
+    (void)rcl_subscription_fini(&trafficCmdSubscriber, &node);
+  }
+  if (gripperCmdSubscriber.impl != NULL)
+  {
+    (void)rcl_subscription_fini(&gripperCmdSubscriber, &node);
+  }
+  if (obstaclePublisher.impl != NULL)
+  {
+    (void)rcl_publisher_fini(&obstaclePublisher, &node);
+  }
+  if (voltagePublisher.impl != NULL)
+  {
+    (void)rcl_publisher_fini(&voltagePublisher, &node);
+  }
+  if (esp2StatusPublisher.impl != NULL)
+  {
+    (void)rcl_publisher_fini(&esp2StatusPublisher, &node);
+  }
+  if (executor.context != NULL)
+  {
+    (void)rclc_executor_fini(&executor);
+  }
+  if (node.impl != NULL)
+  {
+    (void)rcl_node_fini(&node);
+  }
+  if (support.context.impl != NULL)
+  {
+    (void)rclc_support_fini(&support);
+  }
+
+  obstaclePublisher = rcl_get_zero_initialized_publisher();
+  voltagePublisher = rcl_get_zero_initialized_publisher();
+  esp2StatusPublisher = rcl_get_zero_initialized_publisher();
+  positionCmdSubscriber = rcl_get_zero_initialized_subscription();
+  trafficCmdSubscriber = rcl_get_zero_initialized_subscription();
+  gripperCmdSubscriber = rcl_get_zero_initialized_subscription();
+  node = rcl_get_zero_initialized_node();
+  support = {};
+  executor = rclc_executor_get_zero_initialized_executor();
+  microRosInitialized = false;
+}
+
+void runMicroRosConnectedWork()
+{
+  static unsigned long lastVoltagePublish = 0;
+  static unsigned long lastObstaclePublish = 0;
+
+  RCSOFTCHECK(rclc_executor_spin_some(&executor, RCL_MS_TO_NS(5)));
+
+  if (millis() - lastVoltagePublish >= VOLTAGE_PUBLISH_PERIOD_MS)
+  {
+    lastVoltagePublish = millis();
+
+    float voltageToPublish = 0.0;
+
+    if (xSemaphoreTake(voltageMutex, pdMS_TO_TICKS(10)) == pdTRUE)
     {
-      lastVoltagePublish = millis();
-
-      float voltageToPublish = 0.0;
-
-      if (xSemaphoreTake(voltageMutex, pdMS_TO_TICKS(10)) == pdTRUE)
-      {
-        voltageToPublish = latestVoltage;
-        xSemaphoreGive(voltageMutex);
-      }
-
-      voltageMsg.data = voltageToPublish;
-      RCSOFTCHECK(rcl_publish(&voltagePublisher, &voltageMsg, NULL));
+      voltageToPublish = latestVoltage;
+      xSemaphoreGive(voltageMutex);
     }
+
+    voltageMsg.data = voltageToPublish;
+    RCSOFTCHECK(rcl_publish(&voltagePublisher, &voltageMsg, NULL));
+  }
+
+  Esp2StatusEvent statusEvent;
+  while (esp2StatusQueue != NULL && xQueueReceive(esp2StatusQueue, &statusEvent, 0) == pdTRUE)
+  {
+    strncpy(esp2StatusMsgBuffer, statusEvent.text, sizeof(esp2StatusMsgBuffer));
+    esp2StatusMsgBuffer[sizeof(esp2StatusMsgBuffer) - 1] = '\0';
+    esp2StatusMsg.data.size = strlen(esp2StatusMsgBuffer);
+
+    RCSOFTCHECK(rcl_publish(&esp2StatusPublisher, &esp2StatusMsg, NULL));
+  }
+
+  if (millis() - lastObstaclePublish >= MICROROS_PUBLISH_PERIOD_MS)
+  {
+    lastObstaclePublish = millis();
 
     int maskToPublish = 0;
 
@@ -995,10 +1223,71 @@ void microRosTask(void *parameter)
     }
 
     obstacleMsg.data = maskToPublish;
-
     RCSOFTCHECK(rcl_publish(&obstaclePublisher, &obstacleMsg, NULL));
+  }
+}
 
-    vTaskDelayUntil(&lastWakeTime, periodTicks);
+void microRosTask(void *parameter)
+{
+  (void)parameter;
+
+  set_microros_transports();
+  vTaskDelay(MICRO_ROS_INITIAL_STARTUP_DELAY_TICKS);
+
+  MicroRosConnectionState state = MICRO_ROS_WAITING_AGENT;
+
+  while (true)
+  {
+    switch (state)
+    {
+      case MICRO_ROS_WAITING_AGENT:
+        if (RMW_RET_OK == rmw_uros_ping_agent(100, 1))
+        {
+          state = MICRO_ROS_AGENT_AVAILABLE;
+        }
+        else
+        {
+          vTaskDelay(MICRO_ROS_WAITING_AGENT_DELAY_TICKS);
+        }
+        break;
+
+      case MICRO_ROS_AGENT_AVAILABLE:
+        if (createMicroRosEntities())
+        {
+          clearEsp2StatusQueue();
+          state = MICRO_ROS_AGENT_CONNECTED;
+        }
+        else
+        {
+          destroyMicroRosEntities();
+          vTaskDelay(MICRO_ROS_WAITING_AGENT_DELAY_TICKS);
+          state = MICRO_ROS_WAITING_AGENT;
+        }
+        break;
+
+      case MICRO_ROS_AGENT_CONNECTED:
+        if (RMW_RET_OK != rmw_uros_ping_agent(100, 1))
+        {
+          state = MICRO_ROS_AGENT_DISCONNECTED;
+          break;
+        }
+
+        runMicroRosConnectedWork();
+        vTaskDelay(MICRO_ROS_TASK_DELAY_TICKS);
+        break;
+
+      case MICRO_ROS_AGENT_DISCONNECTED:
+        destroyMicroRosEntities();
+        clearEsp2StatusQueue();
+        set_microros_transports();
+        vTaskDelay(MICRO_ROS_CONNECTED_PING_DELAY_TICKS);
+        state = MICRO_ROS_WAITING_AGENT;
+        break;
+
+      default:
+        state = MICRO_ROS_WAITING_AGENT;
+        break;
+    }
   }
 }
 
@@ -1025,18 +1314,19 @@ void setup()
   digitalWrite(TRIG_F, LOW);
   digitalWrite(TRIG_R, LOW);
 
-  pinMode(PWM_PIN, OUTPUT);
-  pinMode(IN1_PIN, OUTPUT);
-  pinMode(IN2_PIN, OUTPUT);
-
   pinMode(ENC_A_PIN, INPUT_PULLUP);
   pinMode(ENC_B_PIN, INPUT_PULLUP);
 
   pinMode(LIMIT_PIN, INPUT);
 
-  attachInterrupt(digitalPinToInterrupt(ENC_A_PIN), encoderISR, CHANGE);
+  setupTrafficPins();
 
+  // Critical order: servos first, then motor PWM.
+  setupGripperServo();
+  setupMotor();
   stopMotor();
+
+  attachInterrupt(digitalPinToInterrupt(ENC_A_PIN), encoderISR, CHANGE);
 
   if (digitalRead(LIMIT_PIN) == HIGH)
   {
@@ -1044,13 +1334,11 @@ void setup()
     homed = true;
   }
 
-  setupTrafficPins();
-  setupGripperServo();
-
   obstacleMutex = xSemaphoreCreateMutex();
   trafficMutex = xSemaphoreCreateMutex();
   voltageMutex = xSemaphoreCreateMutex();
   gripperMutex = xSemaphoreCreateMutex();
+  esp2StatusQueue = xQueueCreate(10, sizeof(Esp2StatusEvent));
 
   xTaskCreatePinnedToCore(
     ultrasonicTask,
