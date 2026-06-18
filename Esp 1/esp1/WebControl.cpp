@@ -222,6 +222,7 @@ const char kControlPage[] PROGMEM = R"HTML(
       <div class="si"><span>Ki pos</span><strong id="Ki_pos">-</strong></div>
       <div class="si"><span>Kp head</span><strong id="Kp_heading_rpm">-</strong></div>
       <div class="si"><span>Ki head</span><strong id="Ki_heading_rpm_per_rad_s">-</strong></div>
+      <div class="si"><span>Kd head</span><strong id="Kd_heading_rpm_per_rad_s">-</strong></div>
       <div class="si"><span>Kp rot</span><strong id="Kp_rotate_rpm">-</strong></div>
       <div class="si"><span>Rot Tol</span><strong id="HEADING_TOLERANCE_DEG">-</strong></div>
     </div>
@@ -231,11 +232,11 @@ const char kControlPage[] PROGMEM = R"HTML(
   <section class="panel">
     <h2>Position Loop Tuning</h2>
     <div class="row">
-      <label>PKP (Kp_pos)<input id="pkp" type="number" step="0.1" value="0.8"></label>
+      <label>PKP (Kp_pos)<input id="pkp" type="number" step="0.01" value="2.05"></label>
       <button onclick="sendValueCommand('PKP','pkp')">SET</button>
     </div>
     <div class="row">
-      <label>PKI (Ki_pos)<input id="pki" type="number" step="0.1" value="0"></label>
+      <label>PKI (Ki_pos)<input id="pki" type="number" step="0.01" value="0"></label>
       <button onclick="sendValueCommand('PKI','pki')">SET</button>
     </div>
   </section>
@@ -244,12 +245,16 @@ const char kControlPage[] PROGMEM = R"HTML(
   <section class="panel">
     <h2>Heading Hold (MOVE)</h2>
     <div class="row">
-      <label>HKP<input id="hkp" type="number" step="1" value="60"></label>
+      <label>HKP<input id="hkp" type="number" step="1" value="260"></label>
       <button onclick="sendValueCommand('HKP','hkp')">SET</button>
     </div>
     <div class="row">
-      <label>HKI<input id="hki" type="number" step="0.1" value="2"></label>
+      <label>HKI<input id="hki" type="number" step="0.1" value="0"></label>
       <button onclick="sendValueCommand('HKI','hki')">SET</button>
+    </div>
+    <div class="row">
+      <label>HKD<input id="hkd" type="number" step="0.1" value="25"></label>
+      <button onclick="sendValueCommand('HKD','hkd')">SET</button>
     </div>
     <div class="btn-row">
       <button onclick="sendCommand('HEADING ON')">HEADING ON</button>
@@ -274,52 +279,68 @@ const char kControlPage[] PROGMEM = R"HTML(
     </div>
   </section>
 
-  <!-- E) Wheel Velocity PI Tuning -->
+  <!-- E) Wheel Velocity PID Tuning -->
   <section class="panel full">
-    <h2>Wheel Velocity PI Tuning</h2>
+    <h2>Wheel Velocity PID Tuning</h2>
     <div class="wheel-grid">
       <div class="wheel-box">
         <h3>Wheel 0 (R1)</h3>
         <div class="row">
-          <label>VKP<input id="vkp0" type="number" step="0.1" value="5.0"></label>
+          <label>VKP<input id="vkp0" type="number" step="0.1" value="8.1"></label>
           <button onclick="sendIndexedCommand('VKP',0,'vkp0')">SET</button>
         </div>
         <div class="row">
-          <label>VKI<input id="vki0" type="number" step="0.01" value="1.15"></label>
+          <label>VKI<input id="vki0" type="number" step="0.01" value="0.13"></label>
           <button onclick="sendIndexedCommand('VKI',0,'vki0')">SET</button>
+        </div>
+        <div class="row">
+          <label>VKD<input id="vkd0" type="number" step="0.01" value="0.00"></label>
+          <button onclick="sendIndexedCommand('VKD',0,'vkd0')">SET</button>
         </div>
       </div>
       <div class="wheel-box">
         <h3>Wheel 1 (R2)</h3>
         <div class="row">
-          <label>VKP<input id="vkp1" type="number" step="0.1" value="5.5"></label>
+          <label>VKP<input id="vkp1" type="number" step="0.1" value="7.6"></label>
           <button onclick="sendIndexedCommand('VKP',1,'vkp1')">SET</button>
         </div>
         <div class="row">
-          <label>VKI<input id="vki1" type="number" step="0.01" value="1.15"></label>
+          <label>VKI<input id="vki1" type="number" step="0.01" value="0.10"></label>
           <button onclick="sendIndexedCommand('VKI',1,'vki1')">SET</button>
+        </div>
+        <div class="row">
+          <label>VKD<input id="vkd1" type="number" step="0.01" value="0.00"></label>
+          <button onclick="sendIndexedCommand('VKD',1,'vkd1')">SET</button>
         </div>
       </div>
       <div class="wheel-box">
         <h3>Wheel 2 (F1)</h3>
         <div class="row">
-          <label>VKP<input id="vkp2" type="number" step="0.1" value="4.5"></label>
+          <label>VKP<input id="vkp2" type="number" step="0.1" value="7.0"></label>
           <button onclick="sendIndexedCommand('VKP',2,'vkp2')">SET</button>
         </div>
         <div class="row">
-          <label>VKI<input id="vki2" type="number" step="0.01" value="1.15"></label>
+          <label>VKI<input id="vki2" type="number" step="0.01" value="0.08"></label>
           <button onclick="sendIndexedCommand('VKI',2,'vki2')">SET</button>
+        </div>
+        <div class="row">
+          <label>VKD<input id="vkd2" type="number" step="0.01" value="0.00"></label>
+          <button onclick="sendIndexedCommand('VKD',2,'vkd2')">SET</button>
         </div>
       </div>
       <div class="wheel-box">
         <h3>Wheel 3 (F2)</h3>
         <div class="row">
-          <label>VKP<input id="vkp3" type="number" step="0.1" value="5.5"></label>
+          <label>VKP<input id="vkp3" type="number" step="0.1" value="7.8"></label>
           <button onclick="sendIndexedCommand('VKP',3,'vkp3')">SET</button>
         </div>
         <div class="row">
-          <label>VKI<input id="vki3" type="number" step="0.01" value="1.30"></label>
+          <label>VKI<input id="vki3" type="number" step="0.01" value="0.12"></label>
           <button onclick="sendIndexedCommand('VKI',3,'vki3')">SET</button>
+        </div>
+        <div class="row">
+          <label>VKD<input id="vkd3" type="number" step="0.01" value="0.00"></label>
+          <button onclick="sendIndexedCommand('VKD',3,'vkd3')">SET</button>
         </div>
       </div>
     </div>
@@ -331,6 +352,10 @@ const char kControlPage[] PROGMEM = R"HTML(
       <div class="row">
         <label>VKIALL (all wheels Ki)<input id="vkiall" type="number" step="0.01" value="0.1"></label>
         <button onclick="sendValueCommand('VKIALL','vkiall')">SET ALL</button>
+      </div>
+      <div class="row">
+        <label>VKDALL (all wheels Kd)<input id="vkdall" type="number" step="0.01" value="0"></label>
+        <button onclick="sendValueCommand('VKDALL','vkdall')">SET ALL</button>
       </div>
     </div>
     <div style="margin-top:12px;font-size:0.82rem;color:var(--muted)">
@@ -344,6 +369,11 @@ const char kControlPage[] PROGMEM = R"HTML(
       <strong id="kiVel_1">-</strong>,
       <strong id="kiVel_2">-</strong>,
       <strong id="kiVel_3">-</strong>
+      &nbsp;|&nbsp; kdVel:
+      <strong id="kdVel_0">-</strong>,
+      <strong id="kdVel_1">-</strong>,
+      <strong id="kdVel_2">-</strong>,
+      <strong id="kdVel_3">-</strong>
     </div>
   </section>
 
@@ -419,6 +449,7 @@ const char kControlPage[] PROGMEM = R"HTML(
       setInputFromStatus('pki', data.Ki_pos);
       setInputFromStatus('hkp', data.Kp_heading_rpm);
       setInputFromStatus('hki', data.Ki_heading_rpm_per_rad_s);
+      setInputFromStatus('hkd', data.Kd_heading_rpm_per_rad_s);
       setInputFromStatus('rkp', data.Kp_rotate_rpm);
       setInputFromStatus('rtol', data.HEADING_TOLERANCE_DEG);
       setInputFromStatus('vkp0', data.kpVel_0);
@@ -429,6 +460,10 @@ const char kControlPage[] PROGMEM = R"HTML(
       setInputFromStatus('vki1', data.kiVel_1);
       setInputFromStatus('vki2', data.kiVel_2);
       setInputFromStatus('vki3', data.kiVel_3);
+      setInputFromStatus('vkd0', data.kdVel_0);
+      setInputFromStatus('vkd1', data.kdVel_1);
+      setInputFromStatus('vkd2', data.kdVel_2);
+      setInputFromStatus('vkd3', data.kdVel_3);
 
       if (data.lastCommandResponse !== undefined) {
         document.getElementById('lastCmdStatus').textContent =

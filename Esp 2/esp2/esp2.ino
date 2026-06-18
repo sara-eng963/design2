@@ -51,6 +51,8 @@
 #define GRIPPER_OPEN_ANGLE 157
 #define GRIPPER_CLOSE_ANGLE 80
 
+#define HOMING_PWM 120
+
 #define LOCK_SERVO_PIN 33
 #define LOCK_OPEN_ANGLE 0
 #define LOCK_CLOSE_ANGLE 90
@@ -66,17 +68,17 @@
 
 // Lower than 30000 to avoid blocking too long.
 // 15000 us roughly covers around 2.5 m max distance.
-const unsigned long TIMEOUT_US = 4000;
+const unsigned long TIMEOUT_US = 15000;
 
 const float OBSTACLE_THRESHOLD_CM = 40.0;
 
 // Time between triggering different sensors.
 // Reduces ultrasonic cross-talk.
-const int SENSOR_GAP_MS = 10;
+const int SENSOR_GAP_MS = 30;
 
 // Sensor task period.
 // ESP2 publishes obstacle status every 100 ms.
-const int SENSOR_TASK_PERIOD_MS = 50;
+const int SENSOR_TASK_PERIOD_MS = 100;
 const int MICROROS_PUBLISH_PERIOD_MS = 50;
 constexpr TickType_t MICRO_ROS_TASK_DELAY_TICKS = pdMS_TO_TICKS(2);
 constexpr TickType_t MICRO_ROS_WAITING_AGENT_DELAY_TICKS = pdMS_TO_TICKS(500);
@@ -122,6 +124,7 @@ bool MOTOR_INVERT = true;
 
 bool pidEnabled = false;
 bool homed = false;
+bool homingActive = false;
 volatile int activePositionCmd = 999;
 
 SemaphoreHandle_t obstacleMutex;
@@ -555,12 +558,38 @@ void runPID()
   }
 }
 
+void runHoming()
+{
+  if (!homingActive) return;
+
+  // Drive toward limit switch at fixed PWM.
+  // Uses moveMotorPositive — flip MOTOR_INVERT if direction is wrong.
+  moveMotorPositive(HOMING_PWM);
+}
+
 void checkHomeLimit()
 {
   if (digitalRead(LIMIT_PIN) == HIGH)
   {
     long pos = getEncoderCount();
     bool homeTargetCompleted = false;
+
+    // Open-loop homing: motor was driven at fixed PWM toward limit.
+    if (homingActive)
+    {
+      stopMotor();
+      zeroEncoder();
+      resetPID();
+
+      homingActive = false;
+      pidEnabled = false;
+      homed = true;
+      queueEsp2Status("homing done");
+      activePositionCmd = 999;
+      homeTargetCompleted = true;
+
+      DEBUG_PRINTLN("Homing complete. Encoder zeroed.");
+    }
 
     if (pidEnabled && targetTicks == ZERO_TICKS)
     {
@@ -581,6 +610,7 @@ void checkHomeLimit()
     {
       stopMotor();
       pidEnabled = false;
+      homingActive = false;
       zeroEncoder();
       if (!homeTargetCompleted && activePositionCmd == 0)
       {
@@ -625,6 +655,15 @@ void positionCmdCallback(const void *msgin)
     resetPID();
     activePositionCmd = 999;
     queueEsp2Status("encoder zeroed");
+  }
+  else if (cmd == -3)
+  {
+    // Homing: drive at fixed PWM toward limit switch.
+    // Motor stops and encoder zeros when limit sensor triggers.
+    pidEnabled = false;
+    homingActive = true;
+    activePositionCmd = 999;
+    queueEsp2Status("homing started");
   }
 }
 
@@ -884,7 +923,11 @@ void motorPidTask(void *parameter)
   {
     checkHomeLimit();
 
-    if (pidEnabled)
+    if (homingActive)
+    {
+      runHoming();
+    }
+    else if (pidEnabled)
     {
       runPID();
     }

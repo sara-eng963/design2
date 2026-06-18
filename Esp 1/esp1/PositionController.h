@@ -6,8 +6,10 @@
 
 extern float Kp_pos;
 extern float Ki_pos;
+extern float Kp_pos_final;
 
-constexpr float POSITION_TOLERANCE = 0.005f;
+constexpr float POSITION_TOLERANCE       = 0.005f;
+constexpr float POSITION_FINAL_THRESHOLD = 0.050f;  // switch to Kp_pos_final inside 50 mm
 constexpr std::uint32_t MOVE_TIMEOUT_MS = 250000000U;
 constexpr std::uint32_t ROTATE_TIMEOUT_MS = 150000000U;
 

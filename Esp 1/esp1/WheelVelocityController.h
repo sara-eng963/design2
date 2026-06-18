@@ -15,5 +15,6 @@ extern float kiVel[WHEEL_COUNT];
 extern float kdVel[WHEEL_COUNT];
 
 void setAllTargetRpm(float rpmValue);
+void applyWheelTargetRpmTrims();
 void resetVelocityControllerState();
 void runVelocityLoopForWheel(WheelIndex wheel, float dtSec);

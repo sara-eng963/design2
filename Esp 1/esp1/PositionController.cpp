@@ -7,9 +7,10 @@
 #include "MotorDriver.h"
 #include "WheelVelocityController.h"
 
-float Kp_pos = 0.4f;
-float Ki_pos = 0.1f;
-constexpr float MAX_VX = 0.5f;
+float Kp_pos = 2.05f;
+float Ki_pos = 0.0f;
+float Kp_pos_final = 8.0f;  // boosted Kp for final 50 mm approach
+constexpr float MAX_VX = 0.35f;
 
 bool positionModeActive = false;
 MotionMode motionMode = MODE_IDLE;
@@ -106,22 +107,24 @@ void runPositionLoop(float dtSec, std::uint32_t nowMs) {
 
   const bool reachedByTolerance = fabs(distanceErrorM) <= POSITION_TOLERANCE;
   if (reachedByTolerance) {
-    setAllTargetRpm(0.0f);
     baseForwardRpm = 0.0f;
     rawBaseForwardRpm = 0.0f;
-    turnCorrectionRPM = 0.0f;
     positionIntegral = 0.0f;
-    headingErrorRad = 0.0f;
-    headingIntegralRadS = 0.0f;
-    resetVelocityControllerState();
-    stopAllMotorHardware();
+    positionModeActive = false;
+    motionMode = MODE_IDLE;
     requestMotionResult(MOTION_RESULT_DONE, MODE_MOVE_FORWARD, MOTION_FAULT_NONE);
     return;
   }
 
   positionIntegral += distanceErrorM * dtSec;
 
-  float vxCommand = (Kp_pos * distanceErrorM) + (Ki_pos * positionIntegral);
+  // Use boosted Kp in the final approach window so low-error RPM is
+  // sufficient to overcome static friction and reach the tolerance band.
+  const float effectiveKp = (fabs(distanceErrorM) <= POSITION_FINAL_THRESHOLD)
+                            ? Kp_pos_final
+                            : Kp_pos;
+
+  float vxCommand = (effectiveKp * distanceErrorM) + (Ki_pos * positionIntegral);
   vxCommand = constrain(vxCommand, -MAX_VX, MAX_VX);
 
   rawBaseForwardRpm = (vxCommand / WHEEL_CIRCUMFERENCE_M) * 60.0f;

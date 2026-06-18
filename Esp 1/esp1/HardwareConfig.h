@@ -2,8 +2,8 @@
 
 #include <Arduino.h>
 
-constexpr float PPR = 374.0f;
-constexpr float WHEEL_DIAMETER_M = 0.097f;
+constexpr float PPR = 360.0f;
+constexpr float WHEEL_DIAMETER_M = 0.095f;
 constexpr float WHEEL_CIRCUMFERENCE_M = WHEEL_DIAMETER_M * 3.14159265358979323846f;
 
 constexpr unsigned long CONTROL_PERIOD_MS = 50;
@@ -22,6 +22,11 @@ enum WheelIndex {
 
 extern const WheelIndex LEFT_WHEELS[2];
 extern const WheelIndex RIGHT_WHEELS[2];
+
+constexpr float TRIM_F1 = 1.00f;
+constexpr float TRIM_R1 = 1.00f;
+constexpr float TRIM_F2 = 1.00f;
+constexpr float TRIM_R2 = 1.00f;
 
 struct WheelConfig {
   const char *name;
